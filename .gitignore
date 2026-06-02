@@ -7,7 +7,6 @@ settings.json
 settings.local.json
 prd*
 prd.md
-clean_code.py
 # C extensions
 *.so
 
