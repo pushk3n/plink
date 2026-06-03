@@ -1,8 +1,7 @@
-"""plink v2.0 - 符号缓存门面
 
-在 ElfSymbolReader 基础上提供面向 UI 的高级符号查询接口：
-分组列表、模糊搜索、最近使用记忆、监控列表管理。
-"""
+
+
+
 
 from __future__ import annotations
 
@@ -19,10 +18,9 @@ _MAX_RECENT = 20
 
 
 class SymbolCache:
-    """UI 层使用的符号缓存门面，封装 ElfSymbolReader。
 
-    负责：分组、搜索、最近使用列表、添加到监控列表的状态管理。
-    """
+
+
 
     def __init__(self, reader: ElfSymbolReader):
         self._reader = reader

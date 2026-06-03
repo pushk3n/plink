@@ -914,6 +914,7 @@ class ElfSymbolReader:
         """从 DIE 解析变量类型，返回 (VarType, 类型名)。
 
         对于 typedef 类型，返回 typedef 名称（如 Vision_Protocol_t）而不是底层类型。
+        会逐层剥离 const/volatile/restrict 等透明标签，遇到 typedef 即采用其名称。
         """
         type_attr = die.attributes.get('DW_AT_type')
         if not type_attr:
@@ -925,14 +926,22 @@ class ElfSymbolReader:
                 return VarType.UNKNOWN, 'unknown'
 
 
-            if ref_die.tag == 'DW_TAG_typedef':
-                typedef_name_attr = ref_die.attributes.get('DW_AT_name')
-                if typedef_name_attr:
-                    typedef_name = typedef_name_attr.value.decode('utf-8', errors='replace')
 
-                    base_die = self._resolve_base_type(ref_die, CU)
-                    var_type, _ = self._die_to_vartype(base_die, CU)
-                    return var_type, typedef_name
+            cur = ref_die
+            while cur and cur.tag in _TRANSPARENT_TAGS:
+                if cur.tag == 'DW_TAG_typedef':
+                    typedef_name_attr = cur.attributes.get('DW_AT_name')
+                    if typedef_name_attr:
+                        typedef_name = typedef_name_attr.value.decode('utf-8', errors='replace')
+                        base_die = self._resolve_base_type(cur, CU)
+                        var_type, _ = self._die_to_vartype(base_die, CU)
+                        return var_type, typedef_name
+
+                inner_attr = cur.attributes.get('DW_AT_type')
+                if not inner_attr:
+                    break
+                cur = self._get_type_die(inner_attr, CU)
+
 
             base_die = self._resolve_base_type(ref_die, CU)
             return self._die_to_vartype(base_die, CU)

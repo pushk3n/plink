@@ -14,18 +14,15 @@ from typing import Any
 
 
 def normalize_path(path: str) -> str:
-    """将 Windows 路径规范化为 GDB/OpenOCD 兼容格式
 
-    GDB MI2 和 OpenOCD Tcl 协议中，反斜杠 \\ 是转义字符。
-    Windows 路径中的 \\ 会被错误解析（如 \\r 变成回车符）。
-    此函数将路径转为绝对路径并使用正斜杠。
 
-    Args:
-        path: 文件路径（Windows 或 Unix 格式）
 
-    Returns:
-        规范化后的路径字符串（使用正斜杠）
-    """
+
+
+
+
+
+
     return str(Path(path).resolve()).replace("\\", "/")
 
 
