@@ -517,7 +517,7 @@ class MainWindow(QMainWindow):
     def _on_modify_value(self, expression: str, value_str: str) -> None:
         """处理变量值修改请求（从 WatchTableWidget 发出）。"""
         if not self._backend or not self._sampling_engine:
-            self._status_label.showMessage("写入失败: 未连接", 3000)
+            self._status_bar.showMessage("写入失败: 未连接", 3000)
             return
 
 
@@ -527,39 +527,43 @@ class MainWindow(QMainWindow):
                 entry = e
                 break
         if not entry or not entry.var_info:
-            self._status_label.showMessage(f"写入失败: 未找到变量 {expression}", 3000)
+            self._status_bar.showMessage(f"写入失败: 未找到变量 {expression}", 3000)
             return
 
         var_info = entry.var_info
 
 
         try:
-            raw_value = self._parse_value_for_write(value_str, var_info)
+            raw_value, truncation_hint = self._parse_value_for_write(value_str, var_info)
         except ValueError as e:
-            self._status_label.showMessage(f"写入失败: {e}", 3000)
+            self._status_bar.showMessage(f"写入失败: {e}", 3000)
             return
 
 
         write_lock = self._sampling_engine.get_write_lock()
         acquired = write_lock.acquire(timeout=0.1)
         if not acquired:
-            self._status_label.showMessage("写入超时，变量未更新 — 采样线程繁忙", 2000)
+            self._status_bar.showMessage("写入超时，变量未更新 — 采样线程繁忙", 2000)
             return
 
         try:
             self._backend.write_variable(var_info, raw_value)
-            self._status_label.showMessage(f"已写入 {expression} = {value_str}", 2000)
+            msg = f"已写入 {expression} = {raw_value}"
+            if truncation_hint:
+                msg += f"（{truncation_hint}）"
+            self._status_bar.showMessage(msg, 3000)
         except WriteError as e:
-            self._status_label.showMessage(f"写入失败: {expression} — {e}", 3000)
+            self._status_bar.showMessage(f"写入失败: {expression} — {e}", 3000)
         except Exception as e:
-            self._status_label.showMessage(f"写入失败: {expression} — {e}", 3000)
+            self._status_bar.showMessage(f"写入失败: {expression} — {e}", 3000)
         finally:
             write_lock.release()
 
-    def _parse_value_for_write(self, value_str: str, var_info: VariableInfo) -> int:
+    def _parse_value_for_write(self, value_str: str, var_info: VariableInfo) -> tuple[int, str | None]:
         """解析用户输入的值为整数（用于写入 MCU 内存）。
 
         支持十进制、十六进制 (0x...)、浮点数（转为 IEEE 754 整数表示）。
+        返回 (raw_value, truncation_hint) —— truncation_hint 在输入值被截断/四舍五入时非 None。
 
         Raises:
             ValueError: 无法解析
@@ -572,29 +576,36 @@ class MainWindow(QMainWindow):
             if '(' in value_str and value_str.endswith(')'):
                 try:
                     inner = value_str[value_str.index('(') + 1:-1]
-                    return int(inner)
+                    return int(inner), None
                 except ValueError:
                     pass
 
             for val, names in var_info.enum_values.items():
                 if value_str in names:
-                    return val
+                    return val, None
 
 
         if var_info.var_type in (VarType.F32, VarType.F64):
             fval = float(value_str)
             if var_info.var_type == VarType.F32:
                 import struct as _struct
-                return _struct.unpack('<I', _struct.pack('<f', fval))[0]
+                return _struct.unpack('<I', _struct.pack('<f', fval))[0], None
             else:
                 import struct as _struct
                 lo, hi = _struct.unpack('<II', _struct.pack('<d', fval))
-                return lo | (hi << 32)
+                return lo | (hi << 32), None
 
 
         if value_str.startswith('0x') or value_str.startswith('0X'):
-            return int(value_str, 16)
-        return int(value_str)
+            return int(value_str, 16), None
+        try:
+            return int(value_str), None
+        except ValueError:
+
+            fval = float(value_str)
+            rounded = round(fval)
+            hint = f"输入值 {value_str} 已四舍五入为 {rounded}"
+            return rounded, hint
 
     def _on_start_sampling(self) -> None:
         if not self._sampling_engine or not self._backend:
@@ -626,8 +637,10 @@ class MainWindow(QMainWindow):
     def _on_reset_mcu(self) -> None:
         """复位 MCU 并从头运行。
 
-        流程：reset_halt → 清空 → 启动采样 → resume
-        确保采样线程在 MCU 恢复运行的瞬间就已经在读取数据。
+        流程：stop sampling → clear → reset_and_run → 等待启动代码完成 → 启动采样
+        通过直接写入 AIRCR 寄存器的 SYSRESETREQ 位触发完整系统复位，
+        启动代码会重新执行（.bss 清零、.data 从 Flash 重新加载），
+        确保变量归零。
         """
         if not self._backend or not self._sampling_engine:
             QMessageBox.warning(self, "提示", "请先连接到目标板")
@@ -642,19 +655,21 @@ class MainWindow(QMainWindow):
             self._sampling_engine.stop()
 
 
-        self._backend.reset_halt()
-
-
         self._buffer_manager.clear_all()
         self._waveform_view.clear()
         self._waveform_view.update_watch_list(self._watch_entries)
 
 
+
+
+        self._backend.reset_and_run()
+
+
+
+        time.sleep(0.2)
+
+
         self._sampling_engine.start(self._target_frequency)
-        time.sleep(0.1)
-
-
-        self._backend.resume()
 
         self._mcu_state_label.setText("MCU: 运行中")
         self._status_label.setText("MCU 已复位，从头开始采样")

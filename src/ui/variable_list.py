@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QModelIndex
 from PyQt6.QtGui import QColor, QBrush, QStandardItemModel, QStandardItem
+from PyQt6.QtGui import QKeySequence
 from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -342,6 +343,30 @@ class VariableTreeWidget(QWidget):
                 self.variable_selected.emit(data["expression"])
 
 
+class _SelectableTable(QTableWidget):
+    """支持单击选中、点击空白处取消选中、Delete 键删除的表格。"""
+
+    delete_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+    def mousePressEvent(self, event):
+        """单击：点到行时选中，点到空白处取消选中。"""
+        index = self.indexAt(event.pos())
+        if index.isValid():
+            super().mousePressEvent(event)
+        else:
+            self.clearSelection()
+
+    def keyPressEvent(self, event):
+        """Delete 键：触发删除信号。"""
+        if event.key() == Qt.Key.Key_Delete:
+            self.delete_requested.emit()
+        else:
+            super().keyPressEvent(event)
+
+
 class WatchTableWidget(QWidget):
     """变量监控表格
 
@@ -379,15 +404,18 @@ class WatchTableWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
 
-        self._table = QTableWidget()
+        self._table = _SelectableTable()
         self._table.setColumnCount(len(self._HEADER_LABELS))
         self._table.setHorizontalHeaderLabels(self._HEADER_LABELS)
         header = self._table.horizontalHeader()
         header.setSectionResizeMode(self.COL_NAME, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(self.COL_VALUE, QHeaderView.ResizeMode.ResizeToContents)
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._on_context_menu)
         self._table.cellDoubleClicked.connect(self._on_cell_double_clicked)
+        self._table.delete_requested.connect(self._on_delete_key)
         layout.addWidget(self._table)
 
     def update_entries(self, entries: list[VarWatchEntry]) -> None:
@@ -496,6 +524,14 @@ class WatchTableWidget(QWidget):
             clipboard = QApplication.clipboard()
             if clipboard:
                 clipboard.setText(f"0x{entry.address:08X}")
+
+    def _on_delete_key(self) -> None:
+        """处理 Delete 键：删除当前选中的变量。"""
+        selected_rows = {idx.row() for idx in self._table.selectedIndexes()}
+        for row in sorted(selected_rows, reverse=True):
+            if 0 <= row < len(self._entries):
+                self.variable_removed.emit(self._entries[row].buffer_id)
+                break
 
     def _on_cell_double_clicked(self, row: int, col: int) -> None:
         """双击单元格"""

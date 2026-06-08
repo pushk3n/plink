@@ -479,23 +479,87 @@ class PyOcdBackend:
             return False
 
     def reset_and_run(self) -> bool:
-        """复位 MCU 并立即运行。"""
+        """复位 MCU 并立即运行。
+
+        使用 SYSRESETREQ 触发完整系统复位，确保启动代码重新执行
+        （.bss 清零、.data 从 Flash 重新加载）。
+        """
         if not self._connected or not self._target:
             return False
         try:
-            self._target.reset(halt_after=False)
+            self._reset_with_sysresetreq(halt_after=False)
             return True
         except Exception as e:
             logger.warning("reset 失败: %s", e)
             return False
 
     def reset_halt(self) -> bool:
-        """复位 MCU 并保持暂停状态（用于精确控制启动时刻）。"""
+        """复位 MCU 并保持暂停状态（用于精确控制启动时刻）。
+
+        使用 SYSRESETREQ 触发完整系统复位，确保启动代码重新执行。
+        """
         if not self._connected or not self._target:
             return False
         try:
-            self._target.reset(halt_after=True)
+            self._reset_with_sysresetreq(halt_after=True)
             return True
         except Exception as e:
             logger.warning("reset_halt 失败: %s", e)
             return False
+
+
+    _AIRCR_ADDR = 0xE000ED0C
+
+    _AIRCR_SYSRESETREQ = 0x05FA0004
+
+
+    _DEMCR_ADDR = 0xE000EDFC
+
+    _DEMCR_VC_CORERESET = 0x00000001
+
+    def _reset_with_sysresetreq(self, halt_after: bool = False) -> None:
+        """执行完整系统复位，确保启动代码重新执行（.bss 清零、.data 重加载）。
+
+        策略 1（首选）：pyOCD 标准 API — reset_and_halt() / reset()
+        策略 2（兜底）：直接操作 ARM 核心寄存器 — AIRCR + DEMCR VC_CORERESET
+        """
+        target = self._target
+
+
+        try:
+            reset_type = getattr(target, 'ResetType', None)
+            if reset_type is not None:
+                reset_type = getattr(reset_type, 'SW_SYSTEM', None)
+
+            if halt_after:
+                target.reset_and_halt(reset_type=reset_type)
+            else:
+                target.reset(reset_type=reset_type)
+
+            logger.debug("pyOCD API 复位成功 (halt_after=%s)", halt_after)
+            return
+        except Exception as e:
+            logger.debug("pyOCD API 复位失败 (%s)，回退到寄存器操作", e)
+
+
+        try:
+            saved_demcr = None
+            if halt_after:
+
+
+                saved_demcr = target.read32(self._DEMCR_ADDR)
+                target.write32(self._DEMCR_ADDR, saved_demcr | self._DEMCR_VC_CORERESET)
+
+
+            target.write32(self._AIRCR_ADDR, self._AIRCR_SYSRESETREQ)
+
+            if halt_after:
+
+                target.wait_halted()
+
+                target.write32(self._DEMCR_ADDR, saved_demcr)
+
+            logger.debug("AIRCR 寄存器复位成功 (halt_after=%s)", halt_after)
+        except Exception as e:
+            logger.error("寄存器复位失败: %s", e)
+            raise
