@@ -37,12 +37,12 @@ from ..core.data_types import VarWatchEntry, VariableInfo, VarType
 
 logger = logging.getLogger(__name__)
 
-
+# TYPE_CHECKING 导入，避免运行时循环导入
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ..core.symbol_cache import SymbolCache
 
-
+# 预设颜色列表
 PRESET_COLORS = [
     "#00FF00", "#FF0000", "#0000FF", "#FFFF00", "#FF00FF", "#00FFFF",
     "#FF8000", "#8000FF", "#00FF80", "#FF0080", "#80FF00", "#0080FF",
@@ -55,9 +55,9 @@ class VariableTreeWidget(QWidget):
     左侧显示全局变量树 (按文件分组)，支持结构体/类懒展开（含继承成员）。
     """
 
-    variable_selected = pyqtSignal(str)
+    variable_selected = pyqtSignal(str)  # 变量表达式被选中
 
-
+    # 占位子节点标记，用于显示展开箭头
     _PLACEHOLDER_TAG = "__placeholder__"
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -70,7 +70,7 @@ class VariableTreeWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-
+        # 树形视图
         self._tree = QTreeWidget()
         self._tree.setHeaderLabels(["变量", "类型"])
         self._tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -88,7 +88,7 @@ class VariableTreeWidget(QWidget):
         self._variables = variables
         self._tree.clear()
 
-
+        # 按文件分组
         file_groups: dict[str, list[dict]] = {}
         for var in variables:
             file_name = var.get("file", "unknown")
@@ -96,7 +96,7 @@ class VariableTreeWidget(QWidget):
                 file_groups[file_name] = []
             file_groups[file_name].append(var)
 
-
+        # 构建树
         for file_name, vars_list in file_groups.items():
             file_item = QTreeWidgetItem(self._tree, [file_name])
             file_item.setData(0, Qt.ItemDataRole.UserRole, {"type": "file"})
@@ -137,7 +137,7 @@ class VariableTreeWidget(QWidget):
             "expression": var.name,
             "var_info": var,
         })
-
+        # 结构体/类：加占位子节点，让 QTreeWidget 显示 ▶ 箭头
         if var.is_struct and self._cache:
             placeholder = QTreeWidgetItem(item, ["..."])
             placeholder.setData(0, Qt.ItemDataRole.UserRole, {"type": self._PLACEHOLDER_TAG})
@@ -157,7 +157,7 @@ class VariableTreeWidget(QWidget):
 
         item_type = data.get("type")
 
-
+        # 普通变量或嵌套类型成员：检查占位符
         if item_type == "variable":
             if item.childCount() == 1:
                 child_data = item.child(0).data(0, Qt.ItemDataRole.UserRole)
@@ -166,7 +166,7 @@ class VariableTreeWidget(QWidget):
                     expression = data.get("expression", data.get("name", ""))
                     self._load_struct_children(item, expression)
 
-
+        # 嵌套类型节点（如 "InnerStruct [struct]"）：展开成员
         elif item_type == "nested_type":
             if item.childCount() == 1:
                 child_data = item.child(0).data(0, Qt.ItemDataRole.UserRole)
@@ -185,14 +185,14 @@ class VariableTreeWidget(QWidget):
         if not var_info:
             return
 
-
+        # 数组类型：显示各元素
         if var_info.is_array:
             elements = self._cache.get_array_elements(var_name)
             for elem in elements:
                 self._add_var_item(item, elem)
             return
 
-
+        # 指针类型：显示指向的目标地址和类型
         if var_info.is_pointer:
             ptr_item = QTreeWidgetItem(item, [
                 f"→ @ 0x{var_info.address:08x}  [{var_info.type_name}]"
@@ -203,7 +203,7 @@ class VariableTreeWidget(QWidget):
             })
             return
 
-
+        # 枚举类型：显示枚举值
         enum_values = self._cache.get_enum_values(var_info.type_name)
         if enum_values:
             for ename, evalue in enum_values:
@@ -216,10 +216,10 @@ class VariableTreeWidget(QWidget):
                 })
             return
 
-
+        # 尝试按来源类型分组（继承场景）
         groups = self._cache.get_struct_member_groups(var_name)
         if groups:
-
+            # 多个来源类型 -> 分组显示
             for type_name, members in groups.items():
                 if type_name == "self":
                     label = "▸ Members"
@@ -227,12 +227,12 @@ class VariableTreeWidget(QWidget):
                     label = f"▸ [{type_name}]"
                 self._add_group_node(item, label, members)
         else:
-
+            # 单类型或无继承 -> 平铺显示
             members = self._cache.get_struct_members(var_name)
             for member in members:
                 self._add_var_item(item, member)
 
-
+        # 嵌套类型
         nested = self._cache.get_nested_types(var_info.type_name)
         if nested:
             self._add_nested_types_node(item, nested, var_name)
@@ -261,10 +261,10 @@ class VariableTreeWidget(QWidget):
         header.setData(0, Qt.ItemDataRole.UserRole, {"type": "group"})
         header.setForeground(0, QBrush(QColor("#888888")))
         for tname in nested_names:
-
+            # 查找嵌套类型在缓存中的成员名（可能为 parent_var_name.nested_member）
             member_var_name = self._find_nested_member_var(parent_var_name, tname)
             if member_var_name:
-
+                # 嵌套类型成员已在缓存中，使用 _add_var_item 以支持递归展开
                 member_info = self._cache.resolve(member_var_name)
                 if member_info:
                     type_item = QTreeWidgetItem(header, [f"{tname}  [{member_info.type_name}]"])
@@ -278,14 +278,14 @@ class VariableTreeWidget(QWidget):
                         placeholder = QTreeWidgetItem(type_item, ["..."])
                         placeholder.setData(0, Qt.ItemDataRole.UserRole, {"type": self._PLACEHOLDER_TAG})
                     continue
-
+            # 回退：显示为只读嵌套类型（无缓存数据）
             item = QTreeWidgetItem(header, [tname])
             item.setData(0, Qt.ItemDataRole.UserRole, {
                 "type": "nested_type",
                 "type_name": tname,
                 "parent_prefix": parent_var_name,
             })
-
+            # 加占位子节点以显示展开箭头
             placeholder = QTreeWidgetItem(item, ["..."])
             placeholder.setData(0, Qt.ItemDataRole.UserRole, {"type": self._PLACEHOLDER_TAG})
 
@@ -373,13 +373,13 @@ class WatchTableWidget(QWidget):
     v5.0: 11 列 — 启用、变量名、当前值、类型、地址、颜色、Scale、Offset、Max、Min、Avg
     """
 
-    variable_removed = pyqtSignal(int)
-    variable_color_changed = pyqtSignal(int, str)
-    variable_enabled_changed = pyqtSignal(int, bool)
-    variable_value_changed = pyqtSignal(str, str)
-    variable_scale_changed = pyqtSignal(int, float, float)
+    variable_removed = pyqtSignal(int)  # buffer_id
+    variable_color_changed = pyqtSignal(int, str)  # buffer_id, color
+    variable_enabled_changed = pyqtSignal(int, bool)  # buffer_id, enabled
+    variable_value_changed = pyqtSignal(str, str)  # expression, value
+    variable_scale_changed = pyqtSignal(int, float, float)  # buffer_id, scale, offset
 
-
+    # 列索引常量
     COL_ENABLED = 0
     COL_NAME = 1
     COL_VALUE = 2
@@ -403,7 +403,7 @@ class WatchTableWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-
+        # 表格
         self._table = _SelectableTable()
         self._table.setColumnCount(len(self._HEADER_LABELS))
         self._table.setHorizontalHeaderLabels(self._HEADER_LABELS)
@@ -424,39 +424,39 @@ class WatchTableWidget(QWidget):
         self._table.setRowCount(len(entries))
 
         for i, entry in enumerate(entries):
-
+            # 启用复选框
             check = QTableWidgetItem()
             check.setCheckState(
                 Qt.CheckState.Checked if entry.enabled else Qt.CheckState.Unchecked
             )
             self._table.setItem(i, self.COL_ENABLED, check)
 
-
+            # 变量名
             self._table.setItem(i, self.COL_NAME, QTableWidgetItem(entry.expression))
 
-
+            # 当前值 (稍后更新)
             self._table.setItem(i, self.COL_VALUE, QTableWidgetItem("---"))
 
-
+            # 类型
             type_name = entry.var_info.type_name if entry.var_info else "unknown"
             self._table.setItem(i, self.COL_TYPE, QTableWidgetItem(type_name))
 
-
+            # 地址
             addr_str = f"0x{entry.address:08X}" if entry.address else "---"
             self._table.setItem(i, self.COL_ADDRESS, QTableWidgetItem(addr_str))
 
-
+            # 颜色
             color_item = QTableWidgetItem("■")
             color_item.setForeground(QBrush(QColor(entry.color)))
             self._table.setItem(i, self.COL_COLOR, color_item)
 
-
+            # Scale
             self._table.setItem(i, self.COL_SCALE, QTableWidgetItem(f"{entry.scale:.6g}"))
 
-
+            # Offset
             self._table.setItem(i, self.COL_OFFSET, QTableWidgetItem(f"{entry.offset:.6g}"))
 
-
+            # Max/Min/Avg (稍后更新)
             self._table.setItem(i, self.COL_MAX, QTableWidgetItem("---"))
             self._table.setItem(i, self.COL_MIN, QTableWidgetItem("---"))
             self._table.setItem(i, self.COL_AVG, QTableWidgetItem("---"))
@@ -467,7 +467,7 @@ class WatchTableWidget(QWidget):
             if entry.buffer_id == buffer_id:
                 value_item = self._table.item(i, self.COL_VALUE)
                 if value_item:
-
+                    # 枚举语义化显示
                     if entry.var_info and entry.var_info.enum_values:
                         int_val = int(value)
                         names = entry.var_info.enum_values.get(int_val)
@@ -531,7 +531,7 @@ class WatchTableWidget(QWidget):
         for row in sorted(selected_rows, reverse=True):
             if 0 <= row < len(self._entries):
                 self.variable_removed.emit(self._entries[row].buffer_id)
-                break
+                break  # 单选模式下只删一个
 
     def _on_cell_double_clicked(self, row: int, col: int) -> None:
         """双击单元格"""
@@ -540,21 +540,21 @@ class WatchTableWidget(QWidget):
 
         entry = self._entries[row]
 
-
+        # 当前值列：修改值
         if col == self.COL_VALUE:
             self._modify_value(entry)
 
-
+        # Scale 列：编辑缩放因子
         elif col == self.COL_SCALE:
             self._edit_scale_offset(row, entry, is_scale=True)
 
-
+        # Offset 列：编辑偏移
         elif col == self.COL_OFFSET:
             self._edit_scale_offset(row, entry, is_scale=False)
 
     def _modify_value(self, entry: VarWatchEntry) -> None:
         """修改变量值（含枚举选择支持）。"""
-
+        # 枚举类型：使用下拉列表选择
         if entry.var_info and entry.var_info.enum_values:
             items = []
             for val, names in sorted(entry.var_info.enum_values.items()):
@@ -569,7 +569,7 @@ class WatchTableWidget(QWidget):
                     self.variable_value_changed.emit(entry.expression, value)
                 return
 
-
+        # 普通类型：文本输入
         value, ok = QInputDialog.getText(
             self, "修改变量值",
             f"输入 {entry.expression} 的新值:"
@@ -605,23 +605,22 @@ class WatchTableWidget(QWidget):
         else:
             entry.offset = new_val
 
-
+        # 更新表格显示
         self._table.setItem(row, self.COL_SCALE, QTableWidgetItem(f"{entry.scale:.6g}"))
         self._table.setItem(row, self.COL_OFFSET, QTableWidgetItem(f"{entry.offset:.6g}"))
 
-
+        # 通知主窗口
         self.variable_scale_changed.emit(entry.buffer_id, entry.scale, entry.offset)
 
 
 class VariableListPanel(QWidget):
-    """变量列表面板 (组合树形浏览器和监控表格)"""
+    """变量列表面板（变量树浏览器 + 表达式输入）
 
-    add_variable_requested = pyqtSignal(str)
-    remove_variable_requested = pyqtSignal(int)
-    change_color_requested = pyqtSignal(int, str)
-    change_enabled_requested = pyqtSignal(int, bool)
-    modify_value_requested = pyqtSignal(str, str)
-    scale_changed_requested = pyqtSignal(int, float, float)
+    观察表格已拆分为独立的 WatchTableWidget，由主窗口通过 QDockWidget 管理，
+    支持拖拽停靠到任意位置（类似 Keil 的 Watch 窗口）。
+    """
+
+    add_variable_requested = pyqtSignal(str)  # 表达式
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -631,10 +630,7 @@ class VariableListPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-
-        splitter = QSplitter(Qt.Orientation.Vertical)
-
-
+        # 手动输入区
         input_widget = QWidget()
         input_layout = QHBoxLayout(input_widget)
         input_layout.setContentsMargins(0, 0, 0, 0)
@@ -646,26 +642,12 @@ class VariableListPanel(QWidget):
         add_btn = QPushButton("添加")
         add_btn.clicked.connect(self._on_add_variable)
         input_layout.addWidget(add_btn)
-        splitter.addWidget(input_widget)
+        layout.addWidget(input_widget)
 
-
+        # 变量树
         self._tree = VariableTreeWidget()
         self._tree.variable_selected.connect(self.add_variable_requested)
-        splitter.addWidget(self._tree)
-
-
-        self._watch_table = WatchTableWidget()
-        self._watch_table.variable_removed.connect(self.remove_variable_requested)
-        self._watch_table.variable_color_changed.connect(self.change_color_requested)
-        self._watch_table.variable_enabled_changed.connect(self.change_enabled_requested)
-        self._watch_table.variable_value_changed.connect(self.modify_value_requested)
-        self._watch_table.variable_scale_changed.connect(self.scale_changed_requested)
-        splitter.addWidget(self._watch_table)
-
-
-        splitter.setSizes([30, 200, 200])
-
-        layout.addWidget(splitter)
+        layout.addWidget(self._tree, 1)  # stretch=1，变量树占据所有剩余空间
 
     def _on_add_variable(self) -> None:
         """添加变量"""
@@ -681,15 +663,3 @@ class VariableListPanel(QWidget):
     def populate_tree(self, cache: 'SymbolCache') -> None:
         """用 SymbolCache 填充变量树 (v2.0 接口)"""
         self._tree.populate(cache)
-
-    def update_watch_list(self, entries: list[VarWatchEntry]) -> None:
-        """更新监控表格"""
-        self._watch_table.update_entries(entries)
-
-    def update_value(self, buffer_id: int, value: float) -> None:
-        """更新变量值"""
-        self._watch_table.update_value(buffer_id, value)
-
-    def update_stats(self, buffer_id: int, min_v: float, max_v: float, avg_v: float) -> None:
-        """更新局部统计值"""
-        self._watch_table.update_stats(buffer_id, min_v, max_v, avg_v)

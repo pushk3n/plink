@@ -25,7 +25,7 @@ def setup_logging() -> None:
         datefmt="%H:%M:%S",
     )
 
-
+    # 设置 pyqtgraph 日志级别
     logging.getLogger("pyqtgraph").setLevel(logging.WARNING)
 
 
@@ -39,20 +39,20 @@ def main() -> int:
     logger = logging.getLogger(__name__)
     logger.info("plink 启动")
 
-
+    # 创建 QApplication
     app = QApplication(sys.argv)
     app.setApplicationName("plink")
     app.setApplicationVersion("1.0.0")
     app.setOrganizationName("plink")
 
-
+    # 设置高 DPI 支持
     app.setStyle("Fusion")
 
-
+    # 创建主窗口
     window = MainWindow()
     window.show()
 
-
+    # 运行事件循环
     return app.exec()
 
 

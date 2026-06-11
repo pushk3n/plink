@@ -37,9 +37,10 @@ class ConnectionPanel(QWidget):
     _CONFIG_DIR = Path.home() / ".plink"
     _CONFIG_FILE = _CONFIG_DIR / "last_config.json"
 
-
+    # 信号
     connect_requested = pyqtSignal(ConnectionConfig)
     disconnect_requested = pyqtSignal()
+    flash_requested = pyqtSignal()  # 烧录请求
     connection_status_changed = pyqtSignal(bool)
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -55,12 +56,12 @@ class ConnectionPanel(QWidget):
             if self._CONFIG_FILE.exists():
                 with open(self._CONFIG_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-
+                # v3.0 字段
                 self._config.probe_unique_id = data.get("probe_unique_id", "")
                 self._config.target_override = data.get("target_override", "cortex_m")
                 self._config.swd_frequency = data.get("swd_frequency", 8000000)
                 self._config.elf_path = data.get("elf_path", "")
-
+                # 兼容 v2.0 配置（忽略 OpenOCD 相关字段）
                 logger.info("已加载上次配置: %s", self._CONFIG_FILE)
         except Exception as e:
             logger.warning("加载配置失败: %s", e)
@@ -86,11 +87,11 @@ class ConnectionPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
 
-
+        # 探针配置组
         probe_group = QGroupBox("调试探针")
         probe_layout = QVBoxLayout()
 
-
+        # 探针选择
         probe_row = QHBoxLayout()
         probe_row.addWidget(QLabel("探针:"))
         self._probe_combo = QComboBox()
@@ -101,13 +102,13 @@ class ConnectionPanel(QWidget):
         probe_row.addWidget(self._refresh_btn)
         probe_layout.addLayout(probe_row)
 
-
+        # 目标类型（下拉列表）
         target_row = QHBoxLayout()
         target_row.addWidget(QLabel("目标:"))
         self._target_combo = QComboBox()
         self._target_combo.setEditable(True)
         self._target_combo.setMinimumWidth(200)
-
+        # 通用目标 + 常用 STM32 系列
         common_targets = [
             ("cortex_m", "自动检测 (推荐)"),
             ("stm32f051", "STM32F051"),
@@ -123,7 +124,7 @@ class ConnectionPanel(QWidget):
         ]
         for target_id, label in common_targets:
             self._target_combo.addItem(f"{label} ({target_id})", target_id)
-
+        # 设置当前值
         idx = next(
             (i for i, (tid, _) in enumerate(common_targets) if tid == self._config.target_override),
             0,
@@ -132,7 +133,7 @@ class ConnectionPanel(QWidget):
         target_row.addWidget(self._target_combo, 1)
         probe_layout.addLayout(target_row)
 
-
+        # SWD 时钟频率
         freq_row = QHBoxLayout()
         freq_row.addWidget(QLabel("时钟:"))
         self._freq_spin = QSpinBox()
@@ -146,7 +147,7 @@ class ConnectionPanel(QWidget):
         probe_group.setLayout(probe_layout)
         layout.addWidget(probe_group)
 
-
+        # ELF 文件配置组
         elf_group = QGroupBox("符号文件")
         elf_layout = QVBoxLayout()
 
@@ -162,7 +163,7 @@ class ConnectionPanel(QWidget):
         elf_group.setLayout(elf_layout)
         layout.addWidget(elf_group)
 
-
+        # 连接/断开/烧录按钮
         btn_layout = QHBoxLayout()
         self._connect_btn = QPushButton("连接")
         self._connect_btn.clicked.connect(self._on_connect)
@@ -171,18 +172,21 @@ class ConnectionPanel(QWidget):
         self._disconnect_btn.clicked.connect(self._on_disconnect)
         self._disconnect_btn.setEnabled(False)
         btn_layout.addWidget(self._disconnect_btn)
+        self._flash_btn = QPushButton("烧录")
+        self._flash_btn.setToolTip("将已加载的 ELF/AXF 固件烧录到目标 MCU")
+        self._flash_btn.clicked.connect(self._on_flash)
+        self._flash_btn.setEnabled(False)
+        btn_layout.addWidget(self._flash_btn)
         layout.addLayout(btn_layout)
 
-
+        # 进度状态标签
         self._progress_label = QLabel("")
         self._progress_label.setStyleSheet("color: #666; font-size: 11px;")
         layout.addWidget(self._progress_label)
 
-
+        # 连接状态标签
         self._status_label = QLabel("未连接")
         layout.addWidget(self._status_label)
-
-        layout.addStretch()
 
     def _browse_elf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -218,6 +222,10 @@ class ConnectionPanel(QWidget):
     def _on_disconnect(self) -> None:
         self.disconnect_requested.emit()
 
+    def _on_flash(self) -> None:
+        """烧录按钮点击：发出烧录请求信号。"""
+        self.flash_requested.emit()
+
     def _update_config(self) -> None:
         """从 UI 更新配置"""
         self._config.probe_unique_id = self._probe_combo.currentData() or ""
@@ -230,6 +238,7 @@ class ConnectionPanel(QWidget):
         self._connected = connected
         self._connect_btn.setEnabled(not connected)
         self._disconnect_btn.setEnabled(connected)
+        self._flash_btn.setEnabled(connected)
         self._probe_combo.setEnabled(not connected)
         self._refresh_btn.setEnabled(not connected)
         self._target_combo.setEnabled(not connected)

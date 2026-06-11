@@ -21,10 +21,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
+# STM32 RAM 通常从 0x20000000 开始
 _RAM_BASE = 0x20000000
 
-
+# 相邻变量间距 < 此值时合并为同一 Block
 _BLOCK_MERGE_GAP = 64
 
 
@@ -58,7 +58,7 @@ class PyOcdBackend:
         self._connected = False
         self._lock = threading.Lock()
 
-
+    # ── 探针枚举 ──────────────────────────────────────────────────
 
     @staticmethod
     def list_probes() -> list:
@@ -74,7 +74,7 @@ class PyOcdBackend:
             logger.warning("枚举探针失败: %s", e)
             return []
 
-
+    # ── 连接管理 ──────────────────────────────────────────────────
 
     def connect(
         self,
@@ -104,9 +104,9 @@ class PyOcdBackend:
         from pyocd.core.session import Session
 
         try:
-
+            # 统一使用 Session + open()，不用 session_with_chosen_probe（上下文管理器）
             if unique_id:
-
+                # 按 unique_id 查找探针
                 probe = None
                 for p in self.list_probes():
                     if unique_id in p.unique_id:
@@ -126,17 +126,20 @@ class PyOcdBackend:
                 frequency=frequency,
                 connect_mode=connect_mode,
                 resume_on_disconnect=True,
+                options={"enable_read_cache": False},   # 禁止读取缓存，确保每次读取都从目标 RAM 获取最新值
             )
             self._session.open()
+            # 注意：Session 创建时已通过 options={"enable_read_cache": False} 禁用读取缓存，
+            # 确保实时采样场景每次读取都从目标 RAM 获取最新值。
 
-
+            # 获取实际的 CortexM 核心（SoCTarget 不实现 MemoryInterface）
             soc_target = self._session.target
             core = None
             if hasattr(soc_target, 'selected_core') and soc_target.selected_core:
                 core = soc_target.selected_core
             elif hasattr(soc_target, 'cores') and soc_target.cores:
                 core = list(soc_target.cores.values())[0]
-
+            # fallback: target 自身可能就是 core（如指定具体芯片型号时）
             self._target = core if core is not None else soc_target
             self._connected = True
             logger.info("pyOCD 已连接: %s (核心: %s, 模式: %s, 时钟: %d Hz)",
@@ -173,7 +176,7 @@ class PyOcdBackend:
         Returns:
             True 表示重连成功，False 表示失败。
         """
-
+        # 保存当前连接参数
         probe_id = ""
         target = "cortex_m"
         freq = 8000000
@@ -227,7 +230,7 @@ class PyOcdBackend:
                 return 0
         return 0
 
-
+    # ── 内存读取 ──────────────────────────────────────────────────
 
     def read32(self, address: int) -> int:
         """读取 32 位整数。目标运行中可读。"""
@@ -284,7 +287,7 @@ class PyOcdBackend:
 
         n = len(variables)
 
-
+        # 单变量快速路径：直接 read，不走聚合
         if n == 1:
             return self._single_read(variables[0])
 
@@ -314,8 +317,16 @@ class PyOcdBackend:
                 hi = target.read32(var.address + 4)
                 return [lo.to_bytes(4, 'little') + hi.to_bytes(4, 'little')]
             else:
-                data = target.read_memory_block8(var.address, size)
-                return [bytes(data)]
+                # 大块数据：4 字节对齐时优先用 read_memory_block32（更高效）
+                if size % 4 == 0 and var.address % 4 == 0:
+                    words = target.read_memory_block32(var.address, size // 4)
+                    buf = bytearray()
+                    for w in words:
+                        buf.extend(w.to_bytes(4, 'little'))
+                    return [bytes(buf)]
+                else:
+                    data = target.read_memory_block8(var.address, size)
+                    return [bytes(data)]
         except Exception:
             return [None]
 
@@ -324,14 +335,14 @@ class PyOcdBackend:
         target = self._target
         n = len(variables)
 
-
+        # 步骤 1：地址排序，保留原始索引
         indexed = [(i, v) for i, v in enumerate(variables)]
         indexed.sort(key=lambda x: x[1].address)
 
-
-
-        agg_items: list[tuple[int, object]] = []
-        solo_items: list[tuple[int, object]] = []
+        # 步骤 2：分类 — 聚合候选 vs 独立读取
+        # 聚合条件：size <= 8 且 var_type != UNKNOWN 且地址在 RAM 范围内
+        agg_items: list[tuple[int, object]] = []   # (original_idx, var)
+        solo_items: list[tuple[int, object]] = []   # (original_idx, var)
 
         for orig_idx, var in indexed:
             if var.size > 8 or var.var_type.value == 'unknown' or var.address < _RAM_BASE:
@@ -341,17 +352,25 @@ class PyOcdBackend:
 
         results: list[Optional[bytes]] = [None] * n
 
-
+        # 步骤 3：对聚合候选进行聚类
         if agg_items:
             blocks = self._cluster_blocks(agg_items)
             for block in blocks:
                 self._read_block(block, results)
 
-
+        # 步骤 4：独立读取（大块对齐数据优先用 read_memory_block32）
         for orig_idx, var in solo_items:
             try:
-                data = target.read_memory_block8(var.address, var.size)
-                results[orig_idx] = bytes(data)
+                size = var.size
+                if size % 4 == 0 and var.address % 4 == 0:
+                    words = target.read_memory_block32(var.address, size // 4)
+                    buf = bytearray()
+                    for w in words:
+                        buf.extend(w.to_bytes(4, 'little'))
+                    results[orig_idx] = bytes(buf)
+                else:
+                    data = target.read_memory_block8(var.address, size)
+                    results[orig_idx] = bytes(data)
             except Exception:
                 results[orig_idx] = None
 
@@ -374,10 +393,10 @@ class PyOcdBackend:
             var = item[1]
             gap = var.address - prev_end
             if gap < _BLOCK_MERGE_GAP:
-
+                # 合并到当前 Block
                 blocks[-1].append(item)
             else:
-
+                # 新 Block
                 blocks.append([item])
             prev_end = var.address + var.size
 
@@ -391,29 +410,29 @@ class PyOcdBackend:
         """读取一个聚合 Block 并分发结果到 results 数组。"""
         target = self._target
 
-
+        # 计算 Block 的对齐边界
         block_start = block[0][1].address
         block_end = block[-1][1].address + block[-1][1].size
-        aligned_start = block_start & ~3
-        aligned_end = (block_end + 3) & ~3
+        aligned_start = block_start & ~3          # 向下对齐到 4
+        aligned_end = (block_end + 3) & ~3        # 向上对齐到 4
         word_count = (aligned_end - aligned_start) // 4
 
         try:
-
+            # 单次块读取
             words = target.read_memory_block32(aligned_start, word_count)
-
+            # words 是 list[int]，每个是 32-bit 小端
             block_bytes = bytearray()
             for w in words:
                 block_bytes.extend(w.to_bytes(4, 'little'))
 
-
+            # 按偏移切片分发
             for orig_idx, var in block:
                 offset = var.address - aligned_start
                 var_bytes = bytes(block_bytes[offset:offset + var.size])
                 results[orig_idx] = var_bytes
 
         except Exception:
-
+            # 块读取失败，退化为独立读取
             for orig_idx, var in block:
                 try:
                     data = target.read_memory_block8(var.address, var.size)
@@ -421,7 +440,7 @@ class PyOcdBackend:
                 except Exception:
                     results[orig_idx] = None
 
-
+    # ── 内存写入 ──────────────────────────────────────────────────
 
     def write_variable(self, var: 'VariableInfo', raw_int_value: int) -> None:
         """按变量 size 写入整数值。
@@ -447,14 +466,14 @@ class PyOcdBackend:
             elif var.size == 1:
                 target.write8(var.address, raw_int_value & 0xFF)
             else:
-
+                # 大块类型：先 struct.pack 再 write_memory_block8
                 data = raw_int_value.to_bytes(var.size, 'little')
                 target.write_memory_block8(var.address, list(data))
             target.flush()
         except Exception as e:
             raise WriteError(f"写入 {var.name} @ 0x{var.address:08X} 失败: {e}") from e
 
-
+    # ── MCU 控制 ──────────────────────────────────────────────────
 
     def halt(self) -> bool:
         """暂停目标 MCU。"""
@@ -507,14 +526,14 @@ class PyOcdBackend:
             logger.warning("reset_halt 失败: %s", e)
             return False
 
-
+    # AIRCR 寄存器地址（ARM Cortex-M 系统控制块）
     _AIRCR_ADDR = 0xE000ED0C
-
+    # SYSRESETREQ 位（bit 2），写入时必须设置 VECTKEY (0x05FA << 16)
     _AIRCR_SYSRESETREQ = 0x05FA0004
 
-
+    # DEMCR 寄存器地址（Debug Exception and Monitor Control Register）
     _DEMCR_ADDR = 0xE000EDFC
-
+    # VC_CORERESET 位（bit 0）：启用复位向量捕获，复位后立即暂停在第一条指令
     _DEMCR_VC_CORERESET = 0x00000001
 
     def _reset_with_sysresetreq(self, halt_after: bool = False) -> None:
@@ -525,7 +544,7 @@ class PyOcdBackend:
         """
         target = self._target
 
-
+        # ── 策略 1：pyOCD 标准 API（自动处理向量捕获等底层细节） ──
         try:
             reset_type = getattr(target, 'ResetType', None)
             if reset_type is not None:
@@ -541,25 +560,115 @@ class PyOcdBackend:
         except Exception as e:
             logger.debug("pyOCD API 复位失败 (%s)，回退到寄存器操作", e)
 
-
+        # ── 策略 2：直接操作 ARM 核心寄存器 ──
         try:
             saved_demcr = None
             if halt_after:
-
-
+                # 读取当前 DEMCR 值并启用 VC_CORERESET
+                # 复位向量捕获：MCU 复位后会自动暂停在 Reset Vector 的第一条指令
                 saved_demcr = target.read32(self._DEMCR_ADDR)
                 target.write32(self._DEMCR_ADDR, saved_demcr | self._DEMCR_VC_CORERESET)
 
-
+            # 写入 AIRCR 触发 SYSRESETREQ 完整系统复位
             target.write32(self._AIRCR_ADDR, self._AIRCR_SYSRESETREQ)
 
             if halt_after:
-
+                # 等待复位完成并被捕获暂停
                 target.wait_halted()
-
+                # 恢复 DEMCR 原始状态，防止后续非预期的复位捕获
                 target.write32(self._DEMCR_ADDR, saved_demcr)
 
             logger.debug("AIRCR 寄存器复位成功 (halt_after=%s)", halt_after)
         except Exception as e:
             logger.error("寄存器复位失败: %s", e)
             raise
+
+    # ── 固件烧录 ──────────────────────────────────────────────────
+
+    def flash_elf(
+        self,
+        elf_path: str,
+        progress_callback=None,
+        chip_erase: bool = False,
+    ) -> bool:
+        """烧录 ELF/AXF 固件到目标 MCU。
+
+        使用 pyOCD 的 FlashLoader 进行编程，自动处理：
+        - 按 Flash 扇区对齐擦除
+        - 烧录 Flash 段
+        - 烧录后自动复位运行
+
+        关于擦除策略：
+        - chip_erase=False（默认）：按扇区擦除（类似 Keil 和 OpenOCD 的默认行为）。
+          只擦除需要写入的扇区，速度较快，对已有固件影响最小。
+        - chip_erase=True：整片擦除。适用于固件大小变化大、需要清理残留数据的场景。
+          Keil 的 "Erase Full Chip" 和 OpenOCD 的 "flash erase_sector 0 0 last" 都是此模式。
+
+        Args:
+            elf_path: ELF/AXF 文件路径
+            progress_callback: 可选的进度回调 (current_bytes, total_bytes)
+            chip_erase: 是否整片擦除（False = 按扇区擦除）
+
+        Returns:
+            True 表示烧录成功
+
+        Raises:
+            PyOcdError: 烧录失败
+        """
+        if not self._session or not self._target:
+            raise PyOcdError("未连接到探针")
+
+        import os
+        if not os.path.isfile(elf_path):
+            raise PyOcdError(f"文件不存在: {elf_path}")
+
+        try:
+            from pyocd.flash.loader import FlashLoader
+            from elftools.elf.elffile import ELFFile as PyELFFile
+
+            # 读取 ELF 中的可加载段（Flash 段）
+            segments = []
+            with open(elf_path, 'rb') as f:
+                elf = PyELFFile(f)
+                for segment in elf.iter_segments():
+                    if segment['p_type'] == 'PT_LOAD' and segment['p_filesz'] > 0:
+                        paddr = segment['p_paddr']
+                        data = segment.data()
+                        if paddr < 0x20000000:  # 只烧 Flash 段（排除 RAM 段）
+                            segments.append((paddr, data))
+
+            if not segments:
+                raise PyOcdError("ELF 中没有可烧录的 Flash 段")
+
+            total_bytes = sum(len(data) for _, data in segments)
+            logger.info("开始烧录: %s (%d 段, %d 字节)", elf_path, len(segments), total_bytes)
+
+            # 整片擦除（如需要）
+            if chip_erase:
+                if progress_callback:
+                    progress_callback(0, total_bytes, "正在擦除芯片...")
+                logger.info("执行整片擦除...")
+                self._target.mass_erase()
+                logger.info("整片擦除完成")
+
+            # 使用 FlashLoader 烧录（传入 session 对象）
+            # FlashLoader 内部通过 session.board.target 访问 Flash 子系统
+            flash_loader = FlashLoader(self._session)
+            for paddr, data in segments:
+                flash_loader.add_data(paddr, data)
+
+            # commit 会自动按扇区擦除并写入
+            # 分段提交：每段烧录后报告进度
+            flash_loader.commit()
+
+            if progress_callback:
+                progress_callback(total_bytes, total_bytes, "烧录完成")
+
+            logger.info("烧录完成: %s", elf_path)
+            return True
+
+        except PyOcdError:
+            raise
+        except Exception as e:
+            logger.error("烧录失败: %s", e)
+            raise PyOcdError(f"烧录失败: {e}") from e

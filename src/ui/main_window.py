@@ -27,6 +27,8 @@ from PyQt6.QtWidgets import (
     QLabel,
     QPushButton,
     QGroupBox,
+    QProgressDialog,
+    QDockWidget,
 )
 
 from ..core.data_types import (
@@ -41,22 +43,22 @@ from ..core.symbol_cache import SymbolCache
 from ..sampling_engine import SamplingEngine
 from ..ring_buffer import MultiChannelRingBuffer
 from .connection_panel import ConnectionPanel
-from .variable_list import VariableListPanel
+from .variable_list import VariableListPanel, WatchTableWidget
 from .waveform_view import WaveformView
 
 logger = logging.getLogger(__name__)
 
-
+# 预设颜色
 PRESET_COLORS = [
     "#00FF00", "#FF0000", "#0000FF", "#FFFF00", "#FF00FF", "#00FFFF",
     "#FF8000", "#8000FF", "#00FF80", "#FF0080", "#80FF00", "#0080FF",
 ]
 
-
+# 配置文件路径
 _CONFIG_DIR = Path.home() / ".plink"
 _CONFIG_FILE = _CONFIG_DIR / "config.json"
 
-
+# 自动保存防抖延迟（毫秒）
 _AUTO_SAVE_DELAY_MS = 1000
 
 
@@ -69,7 +71,7 @@ class ConnectionWorker(QThread):
     """
 
     progress = pyqtSignal(str)
-    success = pyqtSignal(object, object)
+    success = pyqtSignal(object, object)  # (PyOcdBackend, SymbolCache)
     error = pyqtSignal(str)
 
     def __init__(self, config: ConnectionConfig, parent=None):
@@ -79,7 +81,7 @@ class ConnectionWorker(QThread):
     def run(self):
         cfg = self._config
 
-
+        # Step 1: 解析 ELF（不依赖硬件，立即执行）
         self.progress.emit("正在解析符号文件...")
         reader = ElfSymbolReader()
         try:
@@ -90,7 +92,7 @@ class ConnectionWorker(QThread):
         symbol_count = len(reader.list_globals())
         self.progress.emit(f"符号解析完成: {symbol_count} 个全局变量")
 
-
+        # Step 2: 连接 pyOCD
         self.progress.emit("正在连接调试探针...")
         backend = PyOcdBackend()
         try:
@@ -104,7 +106,7 @@ class ConnectionWorker(QThread):
             self.error.emit(f"pyOCD 连接失败: {e}")
             return
 
-
+        # Step 3: 完成
         cache = SymbolCache(reader)
         self.progress.emit("连接成功")
         self.success.emit(backend, cache)
@@ -122,31 +124,31 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("plink v5.0 - 嵌入式实时波形可视化工具")
         self.setGeometry(100, 100, 1400, 900)
 
-
+        # 核心模块
         self._backend: Optional[PyOcdBackend] = None
         self._symbol_cache: Optional[SymbolCache] = None
         self._sampling_engine: Optional[SamplingEngine] = None
-        self._buffer_manager = MultiChannelRingBuffer(capacity=600000)
+        self._buffer_manager = MultiChannelRingBuffer(capacity=600000)  # ~10分钟 @1000Hz
 
-
+        # 变量监控列表
         self._watch_entries: list[VarWatchEntry] = []
         self._color_index = 0
 
-
+        # CSV 导出配置
         self._csv_export_dir = str(Path.home() / "Documents")
         self._csv_filename_prefix = "plink_data"
 
-
+        # 连接状态
         self._connection_worker: Optional[ConnectionWorker] = None
         self._is_connecting = False
         self._target_frequency = 1000
 
-
+        # 自动保存防抖定时器
         self._auto_save_timer = QTimer(self)
         self._auto_save_timer.setSingleShot(True)
         self._auto_save_timer.timeout.connect(self._auto_save_config)
 
-
+        # 状态更新定时器
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._update_status)
         self._status_timer.start(500)
@@ -162,7 +164,7 @@ class MainWindow(QMainWindow):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-
+        # 左侧面板
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -170,7 +172,7 @@ class MainWindow(QMainWindow):
         self._connection_panel = ConnectionPanel()
         left_layout.addWidget(self._connection_panel)
 
-
+        # 调试控制面板（类似 Keil debug 工具栏）
         debug_group = QGroupBox("调试控制")
         debug_layout = QHBoxLayout(debug_group)
 
@@ -196,22 +198,61 @@ class MainWindow(QMainWindow):
         self._update_debug_controls(False)
 
         self._variable_panel = VariableListPanel()
-        left_layout.addWidget(self._variable_panel)
+        left_layout.addWidget(self._variable_panel, 1)  # stretch=1，变量面板占据所有剩余空间
 
         splitter.addWidget(left_widget)
 
-
+        # 右侧波形视图
         self._waveform_view = WaveformView(self._buffer_manager)
         splitter.addWidget(self._waveform_view)
 
-        splitter.setSizes([400, 1000])
+        # 设置拉伸因子：左侧占 2，右侧占 5，初始宽度比例约 2:5
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 5)
+        splitter.setSizes([450, 1050])
+        # 允许两侧都可以被折叠（拖到极小）
+        splitter.setCollapsible(0, True)
+        splitter.setCollapsible(1, True)
+        left_widget.setMinimumWidth(50)
         layout.addWidget(splitter)
 
+        # ── 可拖拽观察窗口（类似 Keil Watch 窗口）──
+        self._watch_table = WatchTableWidget()
+        self._watch_dock = QDockWidget("变量观察", self)
+        self._watch_dock.setObjectName("WatchDock")
+        self._watch_dock.setWidget(self._watch_table)
+        self._watch_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetMovable
+            | QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+        )
+        self._watch_dock.setMinimumSize(200, 100)
+        # 允许停靠在所有四个方向
+        self._watch_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea
+            | Qt.DockWidgetArea.TopDockWidgetArea
+            | Qt.DockWidgetArea.BottomDockWidgetArea
+        )
+        # 默认停靠在主窗口底部
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, self._watch_dock)
 
+        # 增大停靠窗口分割手柄宽度，避免鼠标难以定位
+        self.setStyleSheet("""
+            QMainWindow::separator {
+                width: 6px;
+                height: 6px;
+            }
+            QMainWindow::separator:hover {
+                background: #409EFF;
+            }
+        """)
+
+        # 状态栏
         self._status_bar = QStatusBar()
         self.setStatusBar(self._status_bar)
 
-
+        # 连接状态指示器
         self._connection_indicator = QLabel("🔴 未连接")
         self._status_bar.addWidget(self._connection_indicator)
 
@@ -221,7 +262,7 @@ class MainWindow(QMainWindow):
     def _setup_menu(self) -> None:
         menubar = self.menuBar()
 
-
+        # 文件菜单
         file_menu = menubar.addMenu("文件")
 
         load_config_action = QAction("加载配置", self)
@@ -244,7 +285,7 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
 
-
+        # 设置菜单
         settings_menu = menubar.addMenu("设置")
 
         freq_menu = settings_menu.addMenu("采样频率")
@@ -259,7 +300,13 @@ class MainWindow(QMainWindow):
         csv_path_action.triggered.connect(self._set_csv_export_path)
         settings_menu.addAction(csv_path_action)
 
+        # 查看菜单
+        view_menu = menubar.addMenu("查看")
+        self._watch_toggle_action = self._watch_dock.toggleViewAction()
+        self._watch_toggle_action.setText("变量观察窗口")
+        view_menu.addAction(self._watch_toggle_action)
 
+        # 帮助菜单
         help_menu = menubar.addMenu("帮助")
         about_action = QAction("关于", self)
         about_action.triggered.connect(self._show_about)
@@ -268,36 +315,42 @@ class MainWindow(QMainWindow):
     def _setup_connections(self) -> None:
         self._connection_panel.connect_requested.connect(self._on_connect)
         self._connection_panel.disconnect_requested.connect(self._on_disconnect)
+        self._connection_panel.flash_requested.connect(self._on_flash)
 
+        # 变量树面板信号
         self._variable_panel.add_variable_requested.connect(self._on_add_variable)
-        self._variable_panel.remove_variable_requested.connect(self._on_remove_variable)
-        self._variable_panel.change_color_requested.connect(self._on_change_color)
-        self._variable_panel.change_enabled_requested.connect(self._on_change_enabled)
-        self._variable_panel.modify_value_requested.connect(self._on_modify_value)
-        self._variable_panel.scale_changed_requested.connect(self._on_change_scale_offset)
+
+        # 可拖拽观察窗口信号
+        self._watch_table.variable_removed.connect(self._on_remove_variable)
+        self._watch_table.variable_color_changed.connect(self._on_change_color)
+        self._watch_table.variable_enabled_changed.connect(self._on_change_enabled)
+        self._watch_table.variable_value_changed.connect(self._on_modify_value)
+        self._watch_table.variable_scale_changed.connect(self._on_change_scale_offset)
+
         self._waveform_view.start_requested.connect(self._on_start_sampling)
         self._waveform_view.pause_requested.connect(self._on_pause_sampling)
 
-
+    # ── 连接管理 ──────────────────────────────────────────────────
 
     def _on_connect(self, config: ConnectionConfig) -> None:
         if self._is_connecting:
             QMessageBox.warning(self, "提示", "正在连接中，请稍候...")
             return
 
-
+        # 验证 ELF 文件路径
         if not config.elf_path or not Path(config.elf_path).exists():
             QMessageBox.warning(self, "提示", "请先选择有效的 ELF/AXF 文件")
             return
 
         self._is_connecting = True
-        self._connection_panel.set_connected(False)
+        # 禁用连接面板所有输入（防止重复点击）
+        self._connection_panel.setEnabled(False)
         self._connection_panel.set_progress("正在连接...")
         self._connection_indicator.setText("🟡 连接中...")
         self._status_label.setText("正在连接...")
         QApplication.processEvents()
 
-
+        # 创建并启动后台连接线程
         self._connection_worker = ConnectionWorker(config, self)
         self._connection_worker.progress.connect(self._on_connection_progress)
         self._connection_worker.success.connect(self._on_connection_success)
@@ -313,16 +366,17 @@ class MainWindow(QMainWindow):
         self._backend = backend
         self._symbol_cache = cache
 
-
+        # 用 SymbolCache 填充变量树
         self._variable_panel.populate_tree(cache)
 
-
+        # 初始化采样引擎
         self._sampling_engine = SamplingEngine(backend, self._buffer_manager)
 
-
+        # 设置连接异常回调
         self._sampling_engine.on_connection_lost = self._on_connection_lost
 
-
+        # 更新 UI 状态
+        self._connection_panel.setEnabled(True)
         self._connection_panel.set_connected(True)
         probe_name = backend.probe_name
         freq_mhz = backend.session_frequency / 1_000_000
@@ -332,12 +386,13 @@ class MainWindow(QMainWindow):
         self._update_debug_controls(True)
         logger.info("连接成功: %d 个全局变量", cache.variable_count)
 
-
+        # 自动加载上次配置
         self._auto_load_config()
 
     def _on_connection_error(self, error_msg: str) -> None:
         logger.error("连接失败: %s", error_msg)
         QMessageBox.critical(self, "连接失败", error_msg)
+        self._connection_panel.setEnabled(True)
         self._connection_panel.set_connected(False)
         self._connection_panel.set_progress("")
         self._connection_indicator.setText("🔴 已断开")
@@ -349,12 +404,12 @@ class MainWindow(QMainWindow):
         logger.warning("连接异常: type=%s, msg=%s", error_type, message)
 
         if error_type == "usb_disconnect":
-
+            # USB 断开：停止采样，弹窗提示
             if self._sampling_engine and self._sampling_engine.is_running:
                 self._sampling_engine.stop()
             self._connection_indicator.setText("🔴 连接已断开")
             self._status_label.setText("USB 连接断开")
-
+            # 注意：不在采样线程中直接弹窗，使用 QTimer 延迟到主线程
             QTimer.singleShot(0, lambda: QMessageBox.critical(
                 self, "连接断开",
                 "USB 连接已断开，请检查线缆后手动重连。\n\n"
@@ -382,32 +437,32 @@ class MainWindow(QMainWindow):
         self._update_sampling_controls()
 
     def _on_disconnect(self) -> None:
-
+        # 停止后台连接线程
         if self._connection_worker and self._connection_worker.isRunning():
             self._connection_worker.terminate()
             self._connection_worker.wait(2000)
             self._connection_worker = None
         self._is_connecting = False
 
-
+        # 停止采样
         if self._sampling_engine:
             self._sampling_engine.stop()
             self._sampling_engine = None
 
-
+        # 断开 pyOCD
         if self._backend:
             self._backend.disconnect()
             self._backend = None
 
         self._symbol_cache = None
 
-
+        # 清空数据
         self._watch_entries.clear()
         self._buffer_manager.clear_all()
         self._waveform_view.clear()
-        self._variable_panel.update_watch_list([])
+        self._watch_table.update_entries([])
 
-
+        # 更新 UI 状态
         self._connection_panel.set_connected(False)
         self._connection_indicator.setText("🔴 未连接")
         self._status_label.setText("已断开")
@@ -415,7 +470,89 @@ class MainWindow(QMainWindow):
         self._update_sampling_controls()
         logger.info("已断开连接")
 
+    def _on_flash(self) -> None:
+        """烧录固件到目标 MCU。
 
+        流程：确认 → 停止采样 → 弹窗进度 → 烧录 → 复位运行
+        """
+        if not self._backend or not self._backend.is_connected:
+            QMessageBox.warning(self, "提示", "请先连接到目标板")
+            return
+
+        # 获取 ELF 路径
+        config = self._connection_panel.get_config()
+        elf_path = config.elf_path
+        if not elf_path or not Path(elf_path).exists():
+            QMessageBox.warning(self, "提示", "请先选择有效的 ELF/AXF 文件")
+            return
+
+        # 确认对话框
+        fname = Path(elf_path).name
+        reply = QMessageBox.question(
+            self, "确认烧录",
+            f"即将烧录固件到目标 MCU：\n\n{elf_path}\n\n"
+            "烧录完成后将自动复位 MCU。\n"
+            "是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # 停止采样
+        if self._sampling_engine and self._sampling_engine.is_running:
+            self._sampling_engine.stop()
+
+        # 进度弹窗
+        progress = QProgressDialog("正在烧录固件...", "取消", 0, 100, self)
+        progress.setWindowTitle(f"烧录 {fname}")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+        QApplication.processEvents()
+
+        def progress_cb(current, total, msg=""):
+            pct = int(current * 100 / total) if total > 0 else 0
+            progress.setValue(pct)
+            if msg:
+                progress.setLabelText(msg)
+            QApplication.processEvents()
+
+        try:
+            progress_cb(0, 100, "正在烧录固件...")
+            self._backend.flash_elf(elf_path, progress_callback=progress_cb)
+            progress.setValue(100)
+            QApplication.processEvents()
+
+            # 烧录成功，复位运行
+            progress.setLabelText("烧录完成，正在复位 MCU...")
+            QApplication.processEvents()
+            self._backend.reset_and_run()
+            self._mcu_state_label.setText("MCU: 运行中")
+            self._status_label.setText(f"固件烧录成功: {fname}，MCU 已复位运行")
+            logger.info("烧录完成: %s", elf_path)
+
+            QMessageBox.information(
+                self, "烧录成功",
+                f"固件 {fname} 已成功烧录到目标 MCU。\n\n"
+                "MCU 已自动复位运行。"
+            )
+
+        except PyOcdError as e:
+            progress.close()
+            logger.error("烧录失败: %s", e)
+            QMessageBox.critical(self, "烧录失败", f"烧录失败：\n\n{e}")
+
+        except Exception as e:
+            progress.close()
+            logger.error("烧录异常: %s", e)
+            QMessageBox.critical(self, "烧录异常", f"烧录过程中发生异常：\n\n{e}")
+
+        finally:
+            progress.close()
+
+    # ── 变量管理 ──────────────────────────────────────────────────
 
     def _on_add_variable(self, expression: str) -> None:
         if not self._symbol_cache:
@@ -426,10 +563,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", f"变量已在观察列表中: {expression}")
             return
 
-
+        # 通过 SymbolCache 查找变量
         var_info = self._symbol_cache.resolve(expression)
         if var_info is None:
-
+            # 尝试模糊搜索
             results = self._symbol_cache.search(expression)
             if results:
                 var_info = results[0]
@@ -437,7 +574,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "添加失败", f"未找到变量: {expression}")
                 return
 
-
+        # 创建监控条目
         entry = VarWatchEntry(
             expression=expression,
             var_info=var_info,
@@ -446,21 +583,21 @@ class MainWindow(QMainWindow):
         )
         self._color_index += 1
 
-
+        # 添加到 SymbolCache 监控列表
         self._symbol_cache.add_to_monitor(var_info)
 
-
+        # 添加到采样引擎（无需 halt MCU）
         if self._sampling_engine:
             buffer_id = self._sampling_engine.add_variable(entry)
             entry.buffer_id = buffer_id
 
-
+        # 更新监控列表
         self._watch_entries.append(entry)
-        self._variable_panel.update_watch_list(self._watch_entries)
+        self._watch_table.update_entries(self._watch_entries)
         self._waveform_view.update_watch_list(self._watch_entries)
         self._update_sampling_controls()
 
-
+        # 触发自动保存
         self._trigger_auto_save()
 
         logger.info("添加变量: %s @ 0x%08X", var_info.name, var_info.address)
@@ -469,7 +606,7 @@ class MainWindow(QMainWindow):
         if self._sampling_engine:
             self._sampling_engine.remove_variable(buffer_id)
 
-
+        # 同步更新 SymbolCache 监控列表
         if self._symbol_cache:
             for entry in self._watch_entries:
                 if entry.buffer_id == buffer_id and entry.var_info:
@@ -477,7 +614,7 @@ class MainWindow(QMainWindow):
                     break
 
         self._watch_entries = [e for e in self._watch_entries if e.buffer_id != buffer_id]
-        self._variable_panel.update_watch_list(self._watch_entries)
+        self._watch_table.update_entries(self._watch_entries)
         self._waveform_view.update_watch_list(self._watch_entries)
 
         if self._sampling_engine and not self._watch_entries and self._sampling_engine.is_running:
@@ -491,7 +628,7 @@ class MainWindow(QMainWindow):
             if entry.buffer_id == buffer_id:
                 entry.color = color
                 break
-        self._variable_panel.update_watch_list(self._watch_entries)
+        self._watch_table.update_entries(self._watch_entries)
         self._waveform_view.update_watch_list(self._watch_entries)
         self._trigger_auto_save()
 
@@ -500,7 +637,7 @@ class MainWindow(QMainWindow):
             if entry.buffer_id == buffer_id:
                 entry.enabled = enabled
                 break
-        self._variable_panel.update_watch_list(self._watch_entries)
+        self._watch_table.update_entries(self._watch_entries)
         self._waveform_view.update_watch_list(self._watch_entries)
         self._trigger_auto_save()
 
@@ -520,7 +657,7 @@ class MainWindow(QMainWindow):
             self._status_bar.showMessage("写入失败: 未连接", 3000)
             return
 
-
+        # 查找对应的 VarWatchEntry
         entry = None
         for e in self._watch_entries:
             if e.expression == expression:
@@ -532,14 +669,14 @@ class MainWindow(QMainWindow):
 
         var_info = entry.var_info
 
-
+        # 解析输入值
         try:
             raw_value, truncation_hint = self._parse_value_for_write(value_str, var_info)
         except ValueError as e:
             self._status_bar.showMessage(f"写入失败: {e}", 3000)
             return
 
-
+        # 获取写锁并执行写入
         write_lock = self._sampling_engine.get_write_lock()
         acquired = write_lock.acquire(timeout=0.1)
         if not acquired:
@@ -570,21 +707,21 @@ class MainWindow(QMainWindow):
         """
         value_str = value_str.strip()
 
-
+        # 枚举类型：解析 "NAME(value)" 格式
         if var_info.enum_values:
-
+            # 尝试从 "NAME(value)" 格式解析
             if '(' in value_str and value_str.endswith(')'):
                 try:
                     inner = value_str[value_str.index('(') + 1:-1]
                     return int(inner), None
                 except ValueError:
                     pass
-
+            # 尝试按枚举名查找
             for val, names in var_info.enum_values.items():
                 if value_str in names:
                     return val, None
 
-
+        # 浮点类型
         if var_info.var_type in (VarType.F32, VarType.F64):
             fval = float(value_str)
             if var_info.var_type == VarType.F32:
@@ -595,13 +732,13 @@ class MainWindow(QMainWindow):
                 lo, hi = _struct.unpack('<II', _struct.pack('<d', fval))
                 return lo | (hi << 32), None
 
-
+        # 整数类型
         if value_str.startswith('0x') or value_str.startswith('0X'):
             return int(value_str, 16), None
         try:
             return int(value_str), None
         except ValueError:
-
+            # 用户输入了浮点数（如 "7.123"），四舍五入为整数并提示用户
             fval = float(value_str)
             rounded = round(fval)
             hint = f"输入值 {value_str} 已四舍五入为 {rounded}"
@@ -632,7 +769,7 @@ class MainWindow(QMainWindow):
 
         self._update_sampling_controls()
 
-
+    # ── 调试控制（类似 Keil debug）──────────────────────────────────
 
     def _on_reset_mcu(self) -> None:
         """复位 MCU 并从头运行。
@@ -650,25 +787,25 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "请先把变量加入观察列表")
             return
 
-
+        # 停止旧采样
         if self._sampling_engine.is_running:
             self._sampling_engine.stop()
 
-
+        # 1. 清空旧数据
         self._buffer_manager.clear_all()
         self._waveform_view.clear()
         self._waveform_view.update_watch_list(self._watch_entries)
 
-
-
-
+        # 2. 触发完整系统复位（SYSRESETREQ via AIRCR 寄存器）
+        #    MCU 会立即复位并从 reset vector 开始执行启动代码：
+        #    SystemInit → .bss 清零 → .data 从 Flash 拷贝 → main()
         self._backend.reset_and_run()
 
-
-
+        # 3. 等待启动代码完成（.bss 清零、.data 初始化、进入 main）
+        #    STM32 启动代码通常在 1ms 内完成，200ms 留足余量
         time.sleep(0.2)
 
-
+        # 4. 启动采样 — 此时变量已被启动代码正确初始化（v1=0）
         self._sampling_engine.start(self._target_frequency)
 
         self._mcu_state_label.setText("MCU: 运行中")
@@ -680,7 +817,7 @@ class MainWindow(QMainWindow):
         if not self._backend:
             return
 
-
+        # 先停止采样引擎（MCU 暂停后读取的值不会变化）
         if self._sampling_engine and self._sampling_engine.is_running:
             self._sampling_engine.stop()
 
@@ -721,7 +858,7 @@ class MainWindow(QMainWindow):
         has_variables = bool(self._watch_entries)
         self._waveform_view.set_sampling_state(connected, has_variables, running)
 
-
+    # ── 状态更新 ──────────────────────────────────────────────────
 
     def _update_status(self) -> None:
         if self._sampling_engine and self._sampling_engine.is_running:
@@ -733,16 +870,16 @@ class MainWindow(QMainWindow):
             )
             self._waveform_view.set_actual_frequency(freq)
 
-
+            # 更新变量值
             for entry in self._watch_entries:
                 buf = self._buffer_manager.get_buffer(entry.buffer_id)
                 if buf:
                     last = buf.get_last_value()
                     if last:
                         _, value = last
-                        self._variable_panel.update_value(entry.buffer_id, value)
+                        self._watch_table.update_value(entry.buffer_id, value)
 
-
+            # 局部统计（Phase 3.3）
             self._update_local_statistics()
 
         elif self._backend and self._sampling_engine and not self._is_connecting:
@@ -771,7 +908,7 @@ class MainWindow(QMainWindow):
             if len(vals) == 0:
                 continue
 
-
+            # 下采样保护：点数 > 2000 时先下采样
             if len(vals) > 2000:
                 step = len(vals) // 2000
                 vals = vals[::step]
@@ -780,7 +917,7 @@ class MainWindow(QMainWindow):
             min_v = float(np.min(vals))
             max_v = float(np.max(vals))
             avg_v = float(np.mean(vals))
-            self._variable_panel.update_stats(entry.buffer_id, min_v, max_v, avg_v)
+            self._watch_table.update_stats(entry.buffer_id, min_v, max_v, avg_v)
 
     def _set_frequency(self, freq: int) -> None:
         self._target_frequency = freq
@@ -790,7 +927,7 @@ class MainWindow(QMainWindow):
         self._update_sampling_controls()
         logger.info("采样频率已设置为 %d Hz", freq)
 
-
+    # ── 配置管理 ──────────────────────────────────────────────────
 
     def _save_config(self) -> None:
         path, _ = QFileDialog.getSaveFileName(
@@ -822,7 +959,7 @@ class MainWindow(QMainWindow):
 
     def _build_config(self) -> dict:
         """构建当前配置字典。"""
-
+        # 获取窗口几何状态
         geometry = self.saveGeometry().toBase64().data().decode('ascii')
         state = self.saveState().toBase64().data().decode('ascii')
 
@@ -855,12 +992,12 @@ class MainWindow(QMainWindow):
 
     def _apply_config(self, config: dict) -> None:
         """应用配置字典到当前状态。"""
-
+        # 恢复变量监控列表
         for var_config in config.get("variables", []):
             expr = var_config.get("expression", "")
             if expr:
                 self._on_add_variable(expr)
-
+                # 恢复颜色、scale、offset
                 for entry in self._watch_entries:
                     if entry.expression == expr:
                         entry.color = var_config.get("color", entry.color)
@@ -868,23 +1005,23 @@ class MainWindow(QMainWindow):
                         entry.offset = var_config.get("offset", entry.offset)
                         break
 
-
+        # 恢复采样参数
         sampling = config.get("sampling", {})
         if sampling:
             self._target_frequency = sampling.get("frequency", self._target_frequency)
 
-
+        # 恢复触发配置
         trigger = config.get("trigger", {})
         if trigger:
             self._waveform_view.set_trigger_config(trigger)
 
-
+        # 恢复 CSV 导出设置
         csv_config = config.get("csv_export", {})
         if csv_config:
             self._csv_export_dir = csv_config.get("directory", self._csv_export_dir)
             self._csv_filename_prefix = csv_config.get("filename_prefix", self._csv_filename_prefix)
 
-
+        # 恢复窗口布局
         window = config.get("window", {})
         if window:
             geometry = window.get("geometry")
@@ -894,8 +1031,8 @@ class MainWindow(QMainWindow):
             if wstate:
                 self.restoreState(bytes(wstate, 'ascii'))
 
-
-        self._variable_panel.update_watch_list(self._watch_entries)
+        # 更新 UI
+        self._watch_table.update_entries(self._watch_entries)
         self._waveform_view.update_watch_list(self._watch_entries)
 
     def _auto_save_config(self) -> None:
@@ -920,7 +1057,7 @@ class MainWindow(QMainWindow):
             for var_config in config.get("variables", []):
                 expr = var_config.get("expression", "")
                 if expr:
-
+                    # 检查 ELF 中是否存在该符号
                     if self._symbol_cache and self._symbol_cache.resolve(expr):
                         self._on_add_variable(expr)
                         for entry in self._watch_entries:
@@ -932,17 +1069,17 @@ class MainWindow(QMainWindow):
                     else:
                         logger.info("配置中的变量在当前 ELF 中未找到，跳过: %s", expr)
 
-
+            # 恢复采样参数
             sampling = config.get("sampling", {})
             if sampling:
                 self._target_frequency = sampling.get("frequency", self._target_frequency)
 
-
+            # 恢复触发配置
             trigger = config.get("trigger", {})
             if trigger:
                 self._waveform_view.set_trigger_config(trigger)
 
-
+            # 恢复窗口布局
             window = config.get("window", {})
             if window:
                 geometry = window.get("geometry")
@@ -952,8 +1089,8 @@ class MainWindow(QMainWindow):
                 if wstate:
                     self.restoreState(bytes(wstate, 'ascii'))
 
-
-            self._variable_panel.update_watch_list(self._watch_entries)
+            # 更新 UI
+            self._watch_table.update_entries(self._watch_entries)
             self._waveform_view.update_watch_list(self._watch_entries)
 
             logger.info("已自动加载配置: %s", _CONFIG_FILE)
@@ -1069,10 +1206,10 @@ class MainWindow(QMainWindow):
             "新增：双游标、局部统计、触发系统、配置持久化"
         )
 
-
+    # ── 窗口事件 ──────────────────────────────────────────────────
 
     def closeEvent(self, event) -> None:
-
+        # 关闭前强制保存配置
         try:
             _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             config = self._build_config()

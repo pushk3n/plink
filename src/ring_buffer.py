@@ -33,8 +33,8 @@ class RingBuffer:
         self._capacity = capacity
         self._timestamps = np.zeros(capacity, dtype=np.int64)
         self._values = np.zeros(capacity, dtype=np.float64)
-        self._head = 0
-        self._count = 0
+        self._head = 0        # 写入位置
+        self._count = 0       # 已写入数量
         self._lock = threading.Lock()
 
     @property
@@ -82,22 +82,22 @@ class RingBuffer:
             return
 
         with self._lock:
-
+            # 计算写入范围
             available = self._capacity - self._count
             if n > available:
-
+                # 数据超出容量，只保留最新的
                 overflow = n - available
                 timestamps_ns = timestamps_ns[overflow:]
                 values = values[overflow:]
                 n = len(timestamps_ns)
 
-
+            # 分段写入 (可能需要绕回)
             end = self._head + n
             if end <= self._capacity:
                 self._timestamps[self._head:end] = timestamps_ns
                 self._values[self._head:end] = values
             else:
-
+                # 绕回写入
                 first_part = self._capacity - self._head
                 self._timestamps[self._head:] = timestamps_ns[:first_part]
                 self._values[self._head:] = values[:first_part]
@@ -124,18 +124,18 @@ class RingBuffer:
 
         head = self._head
         if count < self._capacity:
-
+            # 缓冲区未满，数据连续
             start = head - n
             if start < 0:
                 start = 0
             return self._timestamps[start:head], self._values[start:head]
         else:
-
+            # 缓冲区已满，可能需要绕回
             start = (head - n) % self._capacity
             if start < head:
                 return self._timestamps[start:head], self._values[start:head]
             else:
-
+                # 绕回情况（必须 concatenate，无法避免拷贝）
                 ts = np.concatenate([
                     self._timestamps[start:],
                     self._timestamps[:head]
@@ -169,7 +169,7 @@ class RingBuffer:
         if count == 0:
             return np.array([], dtype=np.int64), np.array([], dtype=np.float64)
 
-
+        # 获取有序数据（view 或 concatenate）
         if count < self._capacity:
             ts = self._timestamps[:count]
             vals = self._values[:count]
@@ -178,7 +178,7 @@ class RingBuffer:
             ts = np.concatenate([self._timestamps[head:], self._timestamps[:head]])
             vals = np.concatenate([self._values[head:], self._values[:head]])
 
-
+        # 布尔索引过滤（返回拷贝，因为后续写入可能覆盖）
         mask = ts >= timestamp_ns
         return ts[mask].copy(), vals[mask].copy()
 
@@ -202,18 +202,18 @@ class RingBuffer:
         if count == 0:
             return np.array([], dtype=np.int64), np.array([], dtype=np.float64)
 
-
+        # 获取有序数据
         if count < self._capacity:
-
+            # 数据连续，直接用 view
             ts = self._timestamps[:count]
             vals = self._values[:count]
         else:
-
+            # 数据可能绕回，需要重排
             head = self._head
             ts = np.concatenate([self._timestamps[head:], self._timestamps[:head]])
             vals = np.concatenate([self._values[head:], self._values[:head]])
 
-
+        # 二分查找范围
         idx_start = np.searchsorted(ts, start_ns, side='left')
         idx_end = np.searchsorted(ts, end_ns, side='right')
 

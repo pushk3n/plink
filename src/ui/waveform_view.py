@@ -40,26 +40,26 @@ from ..ring_buffer import MultiChannelRingBuffer
 
 logger = logging.getLogger(__name__)
 
+# 示波器分格
+HORI_DIV = 10  # 水平 10 格
+VERT_DIV = 6   # 垂直 6 格
 
-HORI_DIV = 10
-VERT_DIV = 6
-
-
+# 间隙过滤阈值（秒）— 相邻采样点间隔超过此值则断开连线
 GAP_THRESHOLD_S = 0.5
 
-
+# 初始视图左侧负时间余量（秒），方便观察波形起始值
 INITIAL_MARGIN_S = 0.5
 
-
+# 预触发格数
 PRE_TRIGGER_DIV = 2
 
 
 class TriggerState(Enum):
     """触发状态机"""
-    IDLE = "idle"
-    ARMED = "armed"
-    TRIGGERED = "triggered"
-    LOCKED = "locked"
+    IDLE = "idle"           # 未使能
+    ARMED = "armed"         # 等待触发
+    TRIGGERED = "triggered" # 已触发
+    LOCKED = "locked"       # 锁定（Single 模式）
 
 
 class WaveformView(QWidget):
@@ -71,7 +71,7 @@ class WaveformView(QWidget):
     - 软件边沿触发器
     """
 
-
+    # 信号
     cursor_position_changed = pyqtSignal(float)
     start_requested = pyqtSignal()
     pause_requested = pyqtSignal()
@@ -87,36 +87,36 @@ class WaveformView(QWidget):
         self._plots: dict[int, pg.PlotDataItem] = {}
         self._time_origin_ns = 0
 
+        # 示波器式参数
+        self._sec_per_div = 0.5         # 秒/格（默认 0.5 → 可见 5 秒）
+        self._val_per_div = 1.0         # 值/格（视图级缩放）
+        self._vert_offset = 0.0         # 垂直偏移（视图级）
+        self._realtime_update = True    # 实时更新（自动跟随）
 
-        self._sec_per_div = 0.5
-        self._val_per_div = 1.0
-        self._vert_offset = 0.0
-        self._realtime_update = True
-
-
+        # 双游标状态
         self._cursor_a: Optional[pg.InfiniteLine] = None
         self._cursor_b: Optional[pg.InfiniteLine] = None
-        self._cursor_a_time: Optional[float] = None
+        self._cursor_a_time: Optional[float] = None  # 绝对时间（相对秒）
         self._cursor_b_time: Optional[float] = None
-        self._active_cursor = 'a'
+        self._active_cursor = 'a'  # 当前激活的游标 ('a' 或 'b')
         self._cursor_dragging = False
-        self._last_mouse_x: Optional[float] = None
+        self._last_mouse_x: Optional[float] = None  # 鼠标最后悬停的 X 坐标（时间）
 
-
+        # 临时游标（鼠标拖动查看）
         self._looking = False
         self._cursor_line: Optional[pg.InfiniteLine] = None
         self._selected_var_index = 0
 
-
+        # 触发系统
         self._trigger_state = TriggerState.IDLE
-        self._trigger_source_idx = -1
-        self._trigger_edge = "rising"
+        self._trigger_source_idx = -1   # 触发源变量索引
+        self._trigger_edge = "rising"   # "rising" 或 "falling"
         self._trigger_threshold = 0.0
-        self._trigger_mode = "Normal"
+        self._trigger_mode = "Normal"   # "Normal" 或 "Single"
         self._trigger_enabled = False
-        self._trigger_ts_ns: Optional[int] = None
-        self._last_trigger_ns = 0
-        self._min_retrigger_ns = 0
+        self._trigger_ts_ns: Optional[int] = None  # 触发点时间戳
+        self._last_trigger_ns = 0       # 上次触发时间（防重触发）
+        self._min_retrigger_ns = 0      # 最短重触发间隔
 
         self._setup_ui()
         self._setup_timer()
@@ -125,7 +125,7 @@ class WaveformView(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-
+        # ── 工具栏 ──
         toolbar = QHBoxLayout()
 
         toolbar.addWidget(QLabel("秒/格:"))
@@ -169,7 +169,7 @@ class WaveformView(QWidget):
         self._pause_btn.clicked.connect(self.pause_requested.emit)
         toolbar.addWidget(self._pause_btn)
 
-
+        # 游标按钮
         self._cursor_a_btn = QPushButton("放置A")
         self._cursor_a_btn.setCheckable(True)
         self._cursor_a_btn.clicked.connect(lambda: self._on_cursor_btn_clicked('a'))
@@ -187,7 +187,7 @@ class WaveformView(QWidget):
 
         layout.addLayout(toolbar)
 
-
+        # ── 触发控制栏 ──
         trigger_bar = QHBoxLayout()
 
         self._trigger_check = QCheckBox("触发使能")
@@ -226,7 +226,7 @@ class WaveformView(QWidget):
 
         layout.addLayout(trigger_bar)
 
-
+        # ── pyqtgraph 绘图区域 ──
         pg.setConfigOptions(antialias=False)
         self._plot_widget = pg.PlotWidget()
         self._plot_widget.setLabel('left', '值')
@@ -234,23 +234,23 @@ class WaveformView(QWidget):
         self._plot_widget.showGrid(x=True, y=True, alpha=0.3)
         self._plot_widget.addLegend()
 
-
+        # 禁用 pyqtgraph 默认鼠标交互，改用自定义实现
         vb = self._plot_widget.getViewBox()
         vb.setMouseEnabled(x=False, y=False)
         vb.setMenuEnabled(False)
 
-
+        # 安装事件过滤器拦截滚轮和鼠标事件
         self._plot_widget.viewport().installEventFilter(self)
 
         layout.addWidget(self._plot_widget)
 
-
+        # ── 水平滚动条 ──
         self._scrollbar = QScrollBar(Qt.Orientation.Horizontal)
         self._scrollbar.setRange(0, 0)
         self._scrollbar.valueChanged.connect(self._on_scroll_changed)
         layout.addWidget(self._scrollbar)
 
-
+        # ── 底部信息栏 ──
         info_bar = QHBoxLayout()
         self._var_combo = QComboBox()
         self._var_combo.setMinimumWidth(120)
@@ -275,18 +275,18 @@ class WaveformView(QWidget):
     def _setup_timer(self) -> None:
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self._refresh_waveforms)
-        self._refresh_timer.start(30)
+        self._refresh_timer.start(30)  # 30ms ≈ 33 FPS（与 LinkScope 一致）
 
-
+    # ── 公共接口 ──────────────────────────────────────────────────
 
     def update_watch_list(self, entries: list[VarWatchEntry]) -> None:
         self._entries = entries
-
+        # 确保选中索引不越界
         if self._entries:
             self._selected_var_index = min(self._selected_var_index, len(self._entries) - 1)
         else:
             self._selected_var_index = 0
-
+        # 更新下拉框
         self._var_combo.blockSignals(True)
         self._var_combo.clear()
         for entry in entries:
@@ -297,7 +297,7 @@ class WaveformView(QWidget):
         self._plot_widget.clear()
         self._plots.clear()
 
-
+        # 重新添加游标线（如果存在）
         if self._cursor_a:
             self._plot_widget.addItem(self._cursor_a)
         if self._cursor_b:
@@ -314,7 +314,7 @@ class WaveformView(QWidget):
         if not entries:
             self._time_origin_ns = 0
 
-
+        # 更新触发源下拉列表
         self._update_trigger_source_list()
 
     def set_actual_frequency(self, freq: float) -> None:
@@ -329,7 +329,7 @@ class WaveformView(QWidget):
         self._plots.clear()
         self._time_origin_ns = 0
         self._scrollbar.setRange(0, 0)
-
+        # 清除游标
         self._cursor_a = None
         self._cursor_b = None
         self._cursor_a_time = None
@@ -349,7 +349,7 @@ class WaveformView(QWidget):
         total_time_s = self._get_total_time_s()
 
         if self._trigger_state == TriggerState.TRIGGERED or self._trigger_state == TriggerState.LOCKED:
-
+            # 触发模式：以触发点为基准
             if self._trigger_ts_ns and self._time_origin_ns:
                 t_trigger = (self._trigger_ts_ns - self._time_origin_ns) / 1e9
                 t_start = t_trigger - PRE_TRIGGER_DIV * self._sec_per_div
@@ -376,22 +376,22 @@ class WaveformView(QWidget):
             if buf and buf.count > 0:
                 ts, _ = buf.get_latest(1)
                 if len(ts) > 0:
-
+                    # 用最新时间戳计算
                     latest_ts = ts[-1]
                     t = float((latest_ts - self._time_origin_ns) / 1e9) if self._time_origin_ns else 0.0
                     total = max(total, t)
         return total
 
-
+    # ── 刷新波形 ──────────────────────────────────────────────────
 
     def _refresh_waveforms(self) -> None:
         if not self._entries:
             return
 
-        visible_time = self._sec_per_div * HORI_DIV
-        value_range = self._val_per_div * VERT_DIV
+        visible_time = self._sec_per_div * HORI_DIV  # 可见时间范围（秒）
+        value_range = self._val_per_div * VERT_DIV    # 可见值范围
 
-
+        # 收集所有通道的数据
         series_data: list[tuple[pg.PlotDataItem, np.ndarray, np.ndarray]] = []
         total_time_s = 0.0
 
@@ -404,7 +404,7 @@ class WaveformView(QWidget):
             if not buf:
                 continue
 
-
+            # 获取全部数据（view，不拷贝）
             count = buf.count
             if count == 0:
                 continue
@@ -413,18 +413,18 @@ class WaveformView(QWidget):
             if len(ts) == 0:
                 continue
 
-
+            # 初始化时间原点
             if self._time_origin_ns == 0:
                 self._time_origin_ns = int(ts[0])
 
-
+            # 转换为相对秒
             t_relative = (ts - self._time_origin_ns) / 1_000_000_000
 
-
+            # 应用通道级 scale/offset: Y_display = (Y_raw + offset) * scale
             if entry.scale != 1.0 or entry.offset != 0.0:
                 values = (values + entry.offset) * entry.scale
 
-
+            # 计算总时间范围
             if len(t_relative) > 0:
                 ch_total = float(t_relative[-1])
                 if ch_total > total_time_s:
@@ -435,16 +435,16 @@ class WaveformView(QWidget):
         if not series_data:
             return
 
-
+        # ── 触发判定 ──
         if self._trigger_enabled and self._trigger_state == TriggerState.ARMED:
             self._check_trigger(series_data)
 
-
+        # ── 更新滚动条范围 ──
         total_time_ms = int(total_time_s * 1000)
         visible_time_ms = int(visible_time * 1000)
         scroll_max = max(0, total_time_ms - visible_time_ms)
 
-
+        # 避免触发循环：先 block signals
         self._scrollbar.blockSignals(True)
         old_max = self._scrollbar.maximum()
         self._scrollbar.setMaximum(scroll_max)
@@ -453,14 +453,14 @@ class WaveformView(QWidget):
         ):
             self._scrollbar.setValue(scroll_max)
         elif scroll_max > 0 and old_max > 0:
-
+            # 保持相对位置
             ratio = self._scrollbar.value() / old_max if old_max > 0 else 1.0
             self._scrollbar.setValue(int(ratio * scroll_max))
         self._scrollbar.blockSignals(False)
 
-
+        # ── 计算可见时间范围 ──
         if self._trigger_state in (TriggerState.TRIGGERED, TriggerState.LOCKED):
-
+            # 触发模式：以触发点为时间轴零点
             if self._trigger_ts_ns and self._time_origin_ns:
                 t_trigger = (self._trigger_ts_ns - self._time_origin_ns) / 1e9
                 t_start = t_trigger - PRE_TRIGGER_DIV * self._sec_per_div
@@ -476,9 +476,9 @@ class WaveformView(QWidget):
             t_start = scroll_val / 1000.0 - INITIAL_MARGIN_S
             t_end = t_start + visible_time
 
-
+        # ── 渲染每个通道 ──
         for plot, t_relative, values in series_data:
-
+            # 过滤可见时间范围
             mask = (t_relative >= t_start) & (t_relative <= t_end)
             t_vis = t_relative[mask]
             v_vis = values[mask]
@@ -487,35 +487,35 @@ class WaveformView(QWidget):
                 plot.setData([], [])
                 continue
 
-
+            # 间隙过滤：>0.5s 的间隔断开连线（插入 NaN）
             dt = np.diff(t_vis)
             gap_indices = np.where(dt >= GAP_THRESHOLD_S)[0]
             if len(gap_indices) > 0:
-
-                insert_pos = gap_indices + 1
+                # 在每个间隙处插入 NaN 分隔点
+                insert_pos = gap_indices + 1  # 在间隙后的点前插入
                 t_with_gaps = np.insert(t_vis, insert_pos, np.nan)
                 v_with_gaps = np.insert(v_vis, insert_pos, np.nan)
                 plot.setData(t_with_gaps, v_with_gaps, skipFiniteCheck=True)
             else:
                 plot.setData(t_vis, v_vis, skipFiniteCheck=True)
 
-
+        # ── 更新视图范围 ──
         min_value = -value_range / 2 - self._vert_offset
         max_value = value_range / 2 - self._vert_offset
         self._plot_widget.setXRange(t_start, t_end, padding=0)
         self._plot_widget.setYRange(min_value, max_value, padding=0)
 
-
+        # ── 更新底部信息栏 ──
         self._update_info_bar(t_start, t_end)
 
-
+        # ── Normal 模式自动重触发 ──
         if (self._trigger_state == TriggerState.TRIGGERED
                 and self._trigger_mode == "Normal"):
             now_ns = int(self._time_origin_ns + total_time_s * 1e9)
             if now_ns - self._last_trigger_ns >= self._min_retrigger_ns:
                 self._trigger_state = TriggerState.ARMED
 
-
+    # ── 触发系统 ──────────────────────────────────────────────────
 
     def _check_trigger(
         self,
@@ -525,11 +525,11 @@ class WaveformView(QWidget):
         if self._trigger_source_idx < 0 or self._trigger_source_idx >= len(self._entries):
             return
 
-
+        # 找到触发源的数据
         source_entry = self._entries[self._trigger_source_idx]
         source_data = None
         for plot, t_rel, vals in series_data:
-
+            # 通过 plot 找到对应的 entry
             for entry in self._entries:
                 if entry.buffer_id in self._plots and self._plots[entry.buffer_id] is plot:
                     if entry is source_entry:
@@ -545,7 +545,7 @@ class WaveformView(QWidget):
         if len(vals) < 2:
             return
 
-
+        # 检查最近 N 帧是否跨越阈值
         check_count = min(50, len(vals) - 1)
         for i in range(len(vals) - 1, len(vals) - 1 - check_count, -1):
             if i < 1:
@@ -555,7 +555,7 @@ class WaveformView(QWidget):
 
             if self._trigger_edge == "rising":
                 triggered = prev_val < self._trigger_threshold <= curr_val
-            else:
+            else:  # falling
                 triggered = prev_val > self._trigger_threshold >= curr_val
 
             if triggered:
@@ -586,7 +586,7 @@ class WaveformView(QWidget):
         self._trigger_enabled = checked
         if checked:
             self._trigger_state = TriggerState.ARMED
-
+            # 计算最短重触发间隔
             self._min_retrigger_ns = int(self._sec_per_div * HORI_DIV * 0.5e9)
         else:
             self._trigger_state = TriggerState.IDLE
@@ -628,7 +628,7 @@ class WaveformView(QWidget):
         self._trigger_mode = config.get("mode", "Normal")
         self._trigger_enabled = config.get("enabled", False)
 
-
+        # 更新 UI 控件
         if self._trigger_source_idx < self._trigger_source_combo.count():
             self._trigger_source_combo.setCurrentIndex(self._trigger_source_idx)
         edge_text = "上升沿" if self._trigger_edge == "rising" else "下降沿"
@@ -641,7 +641,7 @@ class WaveformView(QWidget):
             self._trigger_mode_combo.setCurrentIndex(idx)
         self._trigger_check.setChecked(self._trigger_enabled)
 
-
+    # ── 游标系统 ──────────────────────────────────────────────────
 
     def _set_active_cursor(self, cursor: str) -> None:
         """设置当前激活的游标。"""
@@ -711,7 +711,7 @@ class WaveformView(QWidget):
 
     def _update_cursor_labels(self) -> None:
         """更新游标信息标签。"""
-
+        # 游标 A
         if self._cursor_a_time is not None:
             val_a = self._get_cursor_value(self._cursor_a_time)
             self._cursor_a_label.setText(
@@ -721,7 +721,7 @@ class WaveformView(QWidget):
         else:
             self._cursor_a_label.setText("游标A: -")
 
-
+        # 游标 B
         if self._cursor_b_time is not None:
             val_b = self._get_cursor_value(self._cursor_b_time)
             self._cursor_b_label.setText(
@@ -731,7 +731,7 @@ class WaveformView(QWidget):
         else:
             self._cursor_b_label.setText("游标B: -")
 
-
+        # ΔT/ΔV
         if (self._cursor_a_time is not None and self._cursor_b_time is not None):
             dt = self._cursor_b_time - self._cursor_a_time
             val_a = self._get_cursor_value(self._cursor_a_time)
@@ -769,7 +769,7 @@ class WaveformView(QWidget):
             return float(vals[0])
         return None
 
-
+    # ── 游标查看（临时） ──────────────────────────────────────────
 
     def _update_info_bar(self, t_start: float, t_end: float) -> None:
         """更新底部变量名、当前值、查看值显示"""
@@ -778,23 +778,23 @@ class WaveformView(QWidget):
             self._lookval_label.setText("查看值: -")
             return
 
-
+        # 找到选中的变量
         idx = min(self._selected_var_index, len(self._entries) - 1)
         if idx < 0:
             return
         entry = self._entries[idx]
 
-
+        # 当前值
         buf = self._buffer_manager.get_buffer(entry.buffer_id)
         if buf:
             last = buf.get_last_value()
             if last:
                 _, val = last
-
+                # 应用通道缩放显示
                 display_val = (val + entry.offset) * entry.scale
                 self._value_label.setText(f"当前值: {display_val:.6g}")
 
-
+        # 查看值（临时游标位置）
         if self._looking and self._cursor_line is not None:
             look_time = self._cursor_line.value()
             if buf:
@@ -802,10 +802,10 @@ class WaveformView(QWidget):
                 if count > 0:
                     ts, vals = buf.get_latest(count)
                     t_rel = (ts - self._time_origin_ns) / 1_000_000_000
-
+                    # 二分查找最近的采样点
                     idx_arr = np.searchsorted(t_rel, look_time)
                     if idx_arr > 0 and idx_arr < len(t_rel):
-
+                        # 取较近的点
                         if abs(t_rel[idx_arr] - look_time) < abs(t_rel[idx_arr - 1] - look_time):
                             raw_val = float(vals[idx_arr])
                         else:
@@ -821,10 +821,10 @@ class WaveformView(QWidget):
         else:
             self._lookval_label.setText("查看值: -")
 
-
+        # 更新游标标签
         self._update_cursor_labels()
 
-
+    # ── 事件处理 ──────────────────────────────────────────────────
 
     def eventFilter(self, obj, event: QEvent) -> bool:
         """拦截绘图区域的鼠标和滚轮事件，实现 LinkScope 风格交互"""
@@ -833,45 +833,45 @@ class WaveformView(QWidget):
 
         etype = event.type()
 
-
+        # ── 键盘事件 ──
         if etype == QEvent.Type.KeyPress:
-            key_event: QKeyEvent = event
+            key_event: QKeyEvent = event  # type: ignore[assignment]
             key = key_event.key()
             if key == Qt.Key.Key_A:
-
+                # A 键：放置 Cursor A
                 x = self._cursor_line.value() if self._cursor_line else self._last_mouse_x
                 if x is not None:
                     self._place_cursor(x, 'a')
                 return True
             elif key == Qt.Key.Key_B:
-
+                # B 键：放置 Cursor B
                 x = self._cursor_line.value() if self._cursor_line else self._last_mouse_x
                 if x is not None:
                     self._place_cursor(x, 'b')
                 return True
             elif key == Qt.Key.Key_Escape:
-
+                # Esc 键：清除游标或复位触发
                 if self._trigger_state == TriggerState.LOCKED:
                     self._on_trigger_reset()
                 else:
                     self._clear_cursors()
                 return True
             elif key == Qt.Key.Key_Up:
-
+                # 上箭头：切换到上一个观测变量
                 self._switch_selected_var(-1)
                 return True
             elif key == Qt.Key.Key_Down:
-
+                # 下箭头：切换到下一个观测变量
                 self._switch_selected_var(1)
                 return True
 
-
+        # ── 滚轮事件 ──
         if etype == QEvent.Type.Wheel:
-            wheel: QWheelEvent = event
+            wheel: QWheelEvent = event  # type: ignore[assignment]
             modifiers = wheel.modifiers()
 
             if modifiers & Qt.KeyboardModifier.ShiftModifier:
-
+                # Shift+滚轮：垂直缩放
                 delta = self._val_per_div * 0.01
                 if wheel.angleDelta().y() > 0:
                     self._val_div_spin.setValue(max(0.001, self._val_per_div - delta))
@@ -880,7 +880,7 @@ class WaveformView(QWidget):
                 return True
 
             elif modifiers & Qt.KeyboardModifier.ControlModifier:
-
+                # Ctrl+滚轮：水平缩放（调整 sec/Div）
                 delta = self._sec_per_div * 0.01
                 if wheel.angleDelta().y() > 0:
                     self._sec_div_spin.setValue(max(0.001, self._sec_per_div - delta))
@@ -889,8 +889,8 @@ class WaveformView(QWidget):
                 return True
 
             else:
-
-                dist = int(self._sec_per_div * 100)
+                # 无修饰键：时间轴平移
+                dist = int(self._sec_per_div * 100)  # 平移量
                 if wheel.angleDelta().y() > 0:
                     self._scrollbar.setValue(max(0, self._scrollbar.value() - dist))
                 else:
@@ -900,11 +900,11 @@ class WaveformView(QWidget):
                     ))
                 return True
 
-
+        # ── 鼠标按下 ──
         elif etype == QEvent.Type.MouseButtonPress:
-            me: QMouseEvent = event
+            me: QMouseEvent = event  # type: ignore[assignment]
             if me.button() == Qt.MouseButton.LeftButton:
-
+                # 如果点击位置有可拖拽的游标线，让 pyqtgraph 处理拖拽
                 scene_pos = self._plot_widget.mapToScene(me.pos())
                 for item in self._plot_widget.scene().items(scene_pos):
                     if isinstance(item, pg.InfiniteLine) and item.movable:
@@ -913,10 +913,10 @@ class WaveformView(QWidget):
                 self._update_cursor(me.position())
                 return True
 
-
+        # ── 鼠标移动 ──
         elif etype == QEvent.Type.MouseMove:
-            me: QMouseEvent = event
-
+            me: QMouseEvent = event  # type: ignore[assignment]
+            # 悬停时也记录鼠标 X 坐标（供游标按钮使用）
             if self._plot_widget.sceneBoundingRect().contains(me.position()):
                 mouse_point = self._plot_widget.plotItem.vb.mapSceneToView(me.position())
                 self._last_mouse_x = mouse_point.x()
@@ -924,9 +924,9 @@ class WaveformView(QWidget):
                 self._update_cursor(me.position())
                 return True
 
-
+        # ── 鼠标释放 ──
         elif etype == QEvent.Type.MouseButtonRelease:
-            me: QMouseEvent = event
+            me: QMouseEvent = event  # type: ignore[assignment]
             if me.button() == Qt.MouseButton.LeftButton and self._looking:
                 self._looking = False
                 if self._cursor_line:
@@ -970,11 +970,11 @@ class WaveformView(QWidget):
         self._cursor_a_btn.setChecked(False)
         self._cursor_b_btn.setChecked(False)
 
-
+    # ── 控件回调 ──────────────────────────────────────────────────
 
     def _on_sec_div_changed(self, value: float) -> None:
         self._sec_per_div = value
-
+        # 更新最短重触发间隔
         self._min_retrigger_ns = int(self._sec_per_div * HORI_DIV * 0.5e9)
 
     def _on_val_div_changed(self, value: float) -> None:
@@ -988,7 +988,7 @@ class WaveformView(QWidget):
         self._scrollbar.setEnabled(not checked)
 
     def _on_scroll_changed(self, value: int) -> None:
-
+        # 滚动时取消实时更新
         if self._realtime_update:
             self._realtime_check.setChecked(False)
 
@@ -1011,7 +1011,7 @@ class WaveformView(QWidget):
             if count == 0:
                 continue
             ts, vals = buf.get_latest(count)
-
+            # 应用通道缩放
             if entry.scale != 1.0 or entry.offset != 0.0:
                 vals = (vals + entry.offset) * entry.scale
             if len(vals) > 0:
