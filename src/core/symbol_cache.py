@@ -1,6 +1,6 @@
-#plink v2.0 - 符号缓存门面
-#在 ElfSymbolReader 基础上提供面向 UI 的高级符号查询接口：
-#分组列表、模糊搜索、最近使用记忆、监控列表管理。
+
+
+
 
 
 from __future__ import annotations
@@ -18,14 +18,14 @@ _MAX_RECENT = 20
 
 
 class SymbolCache:
-    #UI 层使用的符号缓存门面，封装 ElfSymbolReader。
-    #负责：分组、搜索、最近使用列表、添加到监控列表的状态管理。
-    
+
+
+
 
     def __init__(self, reader: ElfSymbolReader):
         self._reader = reader
         self._monitored: list[VariableInfo] = []
-        self._recent: list[str] = []  # 最近添加的变量名，最多 _MAX_RECENT 条
+        self._recent: list[str] = []
 
     def get_tree(self) -> dict[str, list[VariableInfo]]:
         """返回按来源文件分组的变量树。
@@ -35,12 +35,12 @@ class SymbolCache:
         """
         tree: dict[str, list[VariableInfo]] = {}
         for var in self._reader.list_globals():
-            # 跳过结构体/类的成员变量（如 obj.x），它们通过展开父节点查看
-            # 跳过数组元素（如 arr[0]），它们通过展开数组节点查看
+
+
             if '.' in var.name or '[' in var.name:
                 continue
             key = var.source_file if var.source_file else "globals"
-            # 去掉路径，只保留文件名
+
             key = os.path.basename(key) if '/' in key or '\\' in key else key
             if key not in tree:
                 tree[key] = []
@@ -96,13 +96,13 @@ class SymbolCache:
         if var is None:
             return None
 
-        # 避免重复添加
+
         if any(v.address == var.address for v in self._monitored):
             return var
 
         self._monitored.append(var)
 
-        # 更新最近使用列表
+
         if var.name in self._recent:
             self._recent.remove(var.name)
         self._recent.insert(0, var.name)
