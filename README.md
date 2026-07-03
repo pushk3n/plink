@@ -1,6 +1,6 @@
 # plink
 
-嵌入式实时波形可视化工具，专为 嵌入式 调试设计。通过 pyOCD 直连 DAPLink/STLink/JLink 探针，以最高 2000Hz 采样率实时读取 MCU 内存变量并绘制成示波器风格波形。
+嵌入式实时波形可视化工具，专为 嵌入式 调试设计。通过 pyOCD 直连 DAPLink/STLink/JLink 探针，以最高 5000Hz 采样率实时读取 MCU 内存变量并绘制成示波器风格波形。
 
 ## 教程  
 #### [doc.md](./doc.md)

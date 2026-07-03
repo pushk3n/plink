@@ -289,7 +289,7 @@ class MainWindow(QMainWindow):
         settings_menu = menubar.addMenu("设置")
 
         freq_menu = settings_menu.addMenu("采样频率")
-        for freq in [100, 150, 200, 250, 300, 500, 1000, 2000]:
+        for freq in range(50, 5050, 50):
             action = QAction(f"{freq} Hz", self)
             action.triggered.connect(lambda checked, f=freq: self._set_frequency(f))
             freq_menu.addAction(action)
@@ -1216,7 +1216,7 @@ class MainWindow(QMainWindow):
             "版本: 5.0.0\n"
             "技术栈: Python + PyQt6 + pyelftools + pyOCD\n\n"
             "支持 C++ 命名空间、类成员、模板类型的符号解析\n"
-            "最高支持 2000Hz 采样率（聚合读取引擎）\n"
+            "最高支持 5000Hz 采样率（聚合读取引擎）\n"
             "pyOCD 直连 DAP，无需 OpenOCD 中间层\n"
             "新增：双游标、局部统计、触发系统、配置持久化"
         )

@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 _RAM_BASE = 0x20000000
 
 
-_BLOCK_MERGE_GAP = 64
+_BLOCK_MERGE_GAP_DEFAULT = 64
 
 
 class PyOcdError(Exception):
@@ -57,6 +57,9 @@ class PyOcdBackend:
         self._target = None
         self._connected = False
         self._lock = threading.Lock()
+        self._probe_info: dict = {}
+        self._block_merge_gap: int = _BLOCK_MERGE_GAP_DEFAULT
+        self._block_max_bytes: int = 128
 
 
 
@@ -142,10 +145,17 @@ class PyOcdBackend:
 
             self._target = core if core is not None else soc_target
             self._connected = True
+
+
+            self._probe_info = self._detect_probe_info()
+            self._update_block_merge_strategy()
             logger.info("pyOCD 已连接: %s (核心: %s, 模式: %s, 时钟: %d Hz)",
                         self._session.probe.description,
                         type(self._target).__name__,
                         connect_mode, frequency)
+            logger.info("探针信息: %s", self._probe_info)
+            logger.info("Block 合并策略: merge_gap=%d 字节, max_bytes=%d",
+                        self._block_merge_gap, self._block_max_bytes)
 
         except Exception as e:
             self._connected = False
@@ -158,10 +168,99 @@ class PyOcdBackend:
                 self._session = None
             raise PyOcdError(f"pyOCD 连接失败: {e}") from e
 
+    def _detect_probe_info(self) -> dict:
+        """检测探针信息，包括 CMSIS-DAP 版本和传输参数。
+
+        通过 probe._link (DAPAccess) 内部对象读取实际的协议版本和包大小。
+
+        Returns:
+            探针信息字典，包含:
+            - name: 探针名称
+            - unique_id: 探针唯一ID
+            - probe_type: 探针驱动类型名
+            - dap_version: CMSIS-DAP 协议版本 (如 "2.0.0")
+            - packet_size: USB 包大小（字节）
+            - transport: 传输类型 ("hid" / "bulk")
+        """
+        if not self._session or not self._session.probe:
+            return {}
+
+        probe = self._session.probe
+        info = {
+            'name': probe.description,
+            'unique_id': probe.unique_id,
+            'probe_type': type(probe).__name__,
+            'dap_version': 'unknown',
+            'packet_size': 0,
+            'transport': 'unknown',
+        }
+
+
+        link = getattr(probe, '_link', None)
+        if link is not None:
+
+            version_tuple = getattr(link, '_cmsis_dap_version', None)
+            if version_tuple:
+                info['dap_version'] = '.'.join(str(v) for v in version_tuple)
+
+
+            packet_size = getattr(link, '_packet_size', 0)
+            if packet_size and packet_size > 0:
+                info['packet_size'] = packet_size
+
+
+            interface = getattr(link, '_interface', None)
+            if interface is not None:
+                is_bulk = getattr(interface, 'is_bulk', None)
+                if is_bulk is True:
+                    info['transport'] = 'bulk'
+                elif is_bulk is False:
+                    info['transport'] = 'hid'
+
+        return info
+
+    @property
+    def probe_info(self) -> dict:
+        """获取当前连接的探针信息（CMSIS-DAP版本等）。"""
+        return self._probe_info
+
+    def _update_block_merge_strategy(self) -> None:
+        """根据探针传输类型设置 Block 合并参数。
+
+        packet_size=64 是 CMSIS-DAP 协议层命令缓冲区大小。
+        一个 64 字节 DAP_TransferBlock 命令可装 ~14 个 word 读取 (56字节数据)。
+
+        HID vs Bulk 的核心差异不在包大小，而在流水线能力:
+        - HID: packet_count=1，只能发一个命令等一个回复
+        - Bulk: packet_count=6+，可连续发多个命令流水线执行
+
+        策略:
+        - V1 HID: 保守合并，减少 Block 数以减少 1ms 轮询次数
+        - V2 Bulk: 积极合并，利用流水线能力，但单 Block 不宜过大
+          (过大的 Block 会被拆成过多 DAP 命令，增加协议开销)
+        """
+        transport = self._probe_info.get('transport', 'unknown')
+
+        if transport == 'hid':
+
+
+            self._block_merge_gap = 128
+            self._block_max_bytes = 256
+        elif transport == 'bulk':
+
+
+
+            self._block_merge_gap = 512
+            self._block_max_bytes = 512
+        else:
+            self._block_merge_gap = _BLOCK_MERGE_GAP_DEFAULT
+            self._block_max_bytes = 128
+
     def disconnect(self) -> None:
         """断开连接，释放探针。目标 MCU 继续运行（resume_on_disconnect=True）。"""
         self._connected = False
         self._target = None
+        self._probe_info = {}
         if self._session:
             try:
                 self._session.close()
@@ -381,7 +480,9 @@ class PyOcdBackend:
     ) -> list[list[tuple[int, object]]]:
         """将按地址排序的变量聚类为 Block。
 
-        相邻变量首尾间距 < _BLOCK_MERGE_GAP 时合并为同一 Block。
+        相邻变量首尾间距 < _block_merge_gap 时合并为同一 Block。
+        同时限制单个 Block 的总字节数不超过 _block_max_bytes，
+        避免大 Block 被底层 USB 层拆包后反而增加事务数。
         """
         if not items:
             return []
@@ -392,11 +493,12 @@ class PyOcdBackend:
         for item in items[1:]:
             var = item[1]
             gap = var.address - prev_end
-            if gap < _BLOCK_MERGE_GAP:
+            new_block_bytes = (var.address + var.size) - blocks[-1][0][1].address
 
+
+            if gap < self._block_merge_gap and new_block_bytes <= self._block_max_bytes:
                 blocks[-1].append(item)
             else:
-
                 blocks.append([item])
             prev_end = var.address + var.size
 

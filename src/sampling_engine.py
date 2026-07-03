@@ -1,6 +1,6 @@
 """plink v5.0 - 高速采样引擎
 
-通过 pyOCD 直连 CMSIS-DAP 探针高速读取 MCU 内存数据，支持最高 2000Hz 采样率。
+通过 pyOCD 直连 CMSIS-DAP 探针高速读取 MCU 内存数据，支持最高 5000Hz 采样率。
 v5.0: 聚合读取引擎、写入互斥锁、连接异常分类与信号通知。
 
 v3.0 变更：
@@ -58,7 +58,7 @@ class SamplingEngine:
     典型用法：
         engine = SamplingEngine(backend, ring_buffer)
         engine.add_variable(var_info)
-        engine.start(frequency=2000)
+        engine.start(frequency=5000)
         ...
         engine.stop()
     """
@@ -85,7 +85,6 @@ class SamplingEngine:
         self._write_lock = threading.Lock()
 
 
-        self._unpackers: list[struct.Struct] = []
         self._hot_path_dirty = True
 
 
@@ -93,7 +92,6 @@ class SamplingEngine:
         self._cached_bids: list[int] = []
         self._cached_unpackers: list[struct.Struct] = []
         self._cached_elem_sizes: list[int] = []
-        self._element_sizes: list[int] = []
 
 
         self._running = False
@@ -189,8 +187,8 @@ class SamplingEngine:
 
 
     def set_frequency(self, hz: int) -> None:
-        """设置采样频率，范围 1~2000Hz。"""
-        hz = max(1, min(2000, hz))
+        """设置采样频率，范围 1~5000Hz。"""
+        hz = max(1, min(5000, hz))
         self._interval_ns = int(1_000_000_000 / hz)
         self._frequency = hz
 
@@ -264,19 +262,16 @@ class SamplingEngine:
     def _rebuild_hot_path(self) -> None:
         """当变量列表发生变化时调用。预编译 struct.Struct 并缓存快照。"""
         with self._vars_lock:
-            self._unpackers = [
+            self._cached_vars = list(self._vars)
+            self._cached_bids = list(self._buffer_ids)
+            self._cached_unpackers = [
                 struct.Struct(_STRUCT_FMT_MAP.get(v.var_type, '<f'))
                 for v in self._vars
             ]
-
-            self._element_sizes = [
+            self._cached_elem_sizes = [
                 (v.size // v.array_size if v.is_array and v.array_size > 0 else v.size)
                 for v in self._vars
             ]
-            self._cached_vars = list(self._vars)
-            self._cached_bids = list(self._buffer_ids)
-            self._cached_unpackers = list(self._unpackers)
-            self._cached_elem_sizes = list(self._element_sizes)
         self._hot_path_dirty = False
 
 
@@ -324,7 +319,7 @@ class SamplingEngine:
 
 
     def _sample_loop(self) -> None:
-        """2000Hz 采样主循环。必须在独立线程中运行。"""
+        """高速采样主循环。必须在独立线程中运行。"""
         logger.info("采样循环开始")
 
         if not self._backend.is_connected:

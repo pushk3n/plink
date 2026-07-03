@@ -45,6 +45,9 @@ HORI_DIV = 10
 VERT_DIV = 6
 
 
+SKIP_UNCHANGED_YRANGE = False
+
+
 GAP_THRESHOLD_S = 0.5
 
 
@@ -60,6 +63,28 @@ class TriggerState(Enum):
     ARMED = "armed"
     TRIGGERED = "triggered"
     LOCKED = "locked"
+
+
+def _downsample_decimate(
+    t: np.ndarray, v: np.ndarray, max_points: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """均匀降采样：等间隔抽取，保证时间单调性。
+
+    Args:
+        t: 时间数组（已排序）
+        v: 值数组
+        max_points: 目标最大点数
+
+    Returns:
+        降采样后的 (t, v) 元组
+    """
+    n = len(t)
+    if n <= max_points:
+        return t, v
+    step = n / max_points
+    indices = (np.arange(max_points) * step).astype(np.int64)
+    indices = np.clip(indices, 0, n - 1)
+    return t[indices], v[indices]
 
 
 class WaveformView(QWidget):
@@ -118,6 +143,9 @@ class WaveformView(QWidget):
         self._last_trigger_ns = 0
         self._min_retrigger_ns = 0
 
+
+        self._last_yrange: tuple[float, float] = (float('nan'), float('nan'))
+
         self._setup_ui()
         self._setup_timer()
 
@@ -156,6 +184,11 @@ class WaveformView(QWidget):
         self._realtime_check.setChecked(True)
         self._realtime_check.toggled.connect(self._on_realtime_toggled)
         toolbar.addWidget(self._realtime_check)
+
+        self._pause_render_check = QCheckBox("暂停绘图")
+        self._pause_render_check.setToolTip("停止 UI 渲染，纯采样模式（用于压榨采样率测试）")
+        self._pause_render_check.toggled.connect(self._on_pause_render_toggled)
+        toolbar.addWidget(self._pause_render_check)
 
         fit_btn = QPushButton("适应")
         fit_btn.clicked.connect(self._on_fit_clicked)
@@ -275,7 +308,7 @@ class WaveformView(QWidget):
     def _setup_timer(self) -> None:
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self._refresh_waveforms)
-        self._refresh_timer.start(30)
+        self._refresh_timer.start(33)
 
 
 
@@ -309,6 +342,10 @@ class WaveformView(QWidget):
                     pen=pg.mkPen(entry.color, width=2),
                     name=entry.expression,
                 )
+
+                plot.setDownsampling(auto=True, method='peak')
+
+                plot.setClipToView(True)
                 self._plots[entry.buffer_id] = plot
 
         if not entries:
@@ -389,61 +426,36 @@ class WaveformView(QWidget):
             return
 
         visible_time = self._sec_per_div * HORI_DIV
-        value_range = self._val_per_div * VERT_DIV
 
 
-        series_data: list[tuple[pg.PlotDataItem, np.ndarray, np.ndarray]] = []
         total_time_s = 0.0
-
+        first_ts_ns = None
         for entry in self._entries:
-            if not entry.enabled or entry.buffer_id not in self._plots:
+            if not entry.enabled:
                 continue
-
-            plot = self._plots[entry.buffer_id]
             buf = self._buffer_manager.get_buffer(entry.buffer_id)
             if not buf:
                 continue
-
-
-            count = buf.count
-            if count == 0:
+            tr = buf.get_time_range()
+            if tr is None:
                 continue
-
-            ts, values = buf.get_latest(count)
-            if len(ts) == 0:
-                continue
-
+            f_ts, l_ts = tr
+            if first_ts_ns is None or f_ts < first_ts_ns:
+                first_ts_ns = f_ts
 
             if self._time_origin_ns == 0:
-                self._time_origin_ns = int(ts[0])
+                self._time_origin_ns = f_ts
+            t_rel = (l_ts - self._time_origin_ns) / 1e9
+            if t_rel > total_time_s:
+                total_time_s = t_rel
 
-
-            t_relative = (ts - self._time_origin_ns) / 1_000_000_000
-
-
-            if entry.scale != 1.0 or entry.offset != 0.0:
-                values = (values + entry.offset) * entry.scale
-
-
-            if len(t_relative) > 0:
-                ch_total = float(t_relative[-1])
-                if ch_total > total_time_s:
-                    total_time_s = ch_total
-
-            series_data.append((plot, t_relative, values))
-
-        if not series_data:
+        if first_ts_ns is None or self._time_origin_ns == 0:
             return
-
-
-        if self._trigger_enabled and self._trigger_state == TriggerState.ARMED:
-            self._check_trigger(series_data)
 
 
         total_time_ms = int(total_time_s * 1000)
         visible_time_ms = int(visible_time * 1000)
         scroll_max = max(0, total_time_ms - visible_time_ms)
-
 
         self._scrollbar.blockSignals(True)
         old_max = self._scrollbar.maximum()
@@ -453,14 +465,12 @@ class WaveformView(QWidget):
         ):
             self._scrollbar.setValue(scroll_max)
         elif scroll_max > 0 and old_max > 0:
-
             ratio = self._scrollbar.value() / old_max if old_max > 0 else 1.0
             self._scrollbar.setValue(int(ratio * scroll_max))
         self._scrollbar.blockSignals(False)
 
 
         if self._trigger_state in (TriggerState.TRIGGERED, TriggerState.LOCKED):
-
             if self._trigger_ts_ns and self._time_origin_ns:
                 t_trigger = (self._trigger_ts_ns - self._time_origin_ns) / 1e9
                 t_start = t_trigger - PRE_TRIGGER_DIV * self._sec_per_div
@@ -477,33 +487,94 @@ class WaveformView(QWidget):
             t_end = t_start + visible_time
 
 
-        for plot, t_relative, values in series_data:
+        abs_start_ns = int(self._time_origin_ns + t_start * 1e9)
+        abs_end_ns = int(self._time_origin_ns + t_end * 1e9)
 
-            mask = (t_relative >= t_start) & (t_relative <= t_end)
-            t_vis = t_relative[mask]
-            v_vis = values[mask]
 
-            if len(t_vis) < 2:
+        plot_width = max(200, self._plot_widget.viewport().width())
+        max_render_points = plot_width * 2
+
+
+        if self._trigger_enabled and self._trigger_state == TriggerState.ARMED:
+            series_data_trig = []
+            for entry in self._entries:
+                if not entry.enabled or entry.buffer_id not in self._plots:
+                    continue
+                buf = self._buffer_manager.get_buffer(entry.buffer_id)
+                if not buf or buf.count == 0:
+                    continue
+                ts, vals = buf.get_latest(200)
+                if len(ts) == 0:
+                    continue
+                t_rel = (ts - self._time_origin_ns) / 1e9
+                if entry.scale != 1.0 or entry.offset != 0.0:
+                    vals = (vals + entry.offset) * entry.scale
+                series_data_trig.append((self._plots[entry.buffer_id], t_rel, vals))
+            if series_data_trig:
+                self._check_trigger(series_data_trig)
+
+
+
+        for entry in self._entries:
+            if not entry.enabled or entry.buffer_id not in self._plots:
+                continue
+
+            plot = self._plots[entry.buffer_id]
+            buf = self._buffer_manager.get_buffer(entry.buffer_id)
+            if not buf or buf.count == 0:
                 plot.setData([], [])
                 continue
 
 
-            dt = np.diff(t_vis)
+            ts, values = buf.get_range(abs_start_ns, abs_end_ns)
+            if len(ts) == 0:
+                plot.setData([], [])
+                continue
+
+
+            t_relative = (ts - self._time_origin_ns) / 1_000_000_000
+
+
+            if entry.scale != 1.0 or entry.offset != 0.0:
+                values = (values + entry.offset) * entry.scale
+
+
+            n = len(t_relative)
+            if n > max_render_points:
+                t_relative, values = _downsample_decimate(t_relative, values, max_render_points)
+
+            if len(t_relative) < 2:
+                plot.setData([], [])
+                continue
+
+
+            dt = np.diff(t_relative)
             gap_indices = np.where(dt >= GAP_THRESHOLD_S)[0]
             if len(gap_indices) > 0:
-
                 insert_pos = gap_indices + 1
-                t_with_gaps = np.insert(t_vis, insert_pos, np.nan)
-                v_with_gaps = np.insert(v_vis, insert_pos, np.nan)
+                t_with_gaps = np.insert(t_relative, insert_pos, np.nan)
+                v_with_gaps = np.insert(values, insert_pos, np.nan)
                 plot.setData(t_with_gaps, v_with_gaps, skipFiniteCheck=True)
             else:
-                plot.setData(t_vis, v_vis, skipFiniteCheck=True)
+                plot.setData(t_relative, values, skipFiniteCheck=True)
 
 
+        value_range = self._val_per_div * VERT_DIV
         min_value = -value_range / 2 - self._vert_offset
         max_value = value_range / 2 - self._vert_offset
+
         self._plot_widget.setXRange(t_start, t_end, padding=0)
-        self._plot_widget.setYRange(min_value, max_value, padding=0)
+        self._last_xrange = (t_start, t_end)
+        self._last_xrange_valid = True
+
+
+        if SKIP_UNCHANGED_YRANGE:
+            new_yrange = (min_value, max_value)
+            if new_yrange != self._last_yrange:
+                self._plot_widget.setYRange(min_value, max_value, padding=0)
+                self._last_yrange = new_yrange
+        else:
+            self._plot_widget.setYRange(min_value, max_value, padding=0)
 
 
         self._update_info_bar(t_start, t_end)
@@ -757,7 +828,12 @@ class WaveformView(QWidget):
         if not buf or buf.count == 0:
             return None
 
-        ts, vals = buf.get_latest(buf.count)
+
+        abs_ts = int(self._time_origin_ns + t_rel * 1e9)
+        window_ns = 1_000_000_000
+        ts, vals = buf.get_range(abs_ts - window_ns, abs_ts + window_ns)
+        if len(ts) == 0:
+            return None
         t_rel_arr = (ts - self._time_origin_ns) / 1_000_000_000
         idx_arr = np.searchsorted(t_rel_arr, t_rel)
         if idx_arr > 0 and idx_arr < len(t_rel_arr):
@@ -797,32 +873,29 @@ class WaveformView(QWidget):
 
         if self._looking and self._cursor_line is not None:
             look_time = self._cursor_line.value()
-            if buf:
-                count = buf.count
-                if count > 0:
-                    ts, vals = buf.get_latest(count)
+            if buf and self._time_origin_ns:
+
+                abs_ts = int(self._time_origin_ns + look_time * 1e9)
+                half_ns = 500_000_000
+                ts, vals = buf.get_range(abs_ts - half_ns, abs_ts + half_ns)
+                if len(ts) > 0:
                     t_rel = (ts - self._time_origin_ns) / 1_000_000_000
-
                     idx_arr = np.searchsorted(t_rel, look_time)
-                    if idx_arr > 0 and idx_arr < len(t_rel):
-
-                        if abs(t_rel[idx_arr] - look_time) < abs(t_rel[idx_arr - 1] - look_time):
-                            raw_val = float(vals[idx_arr])
-                        else:
-                            raw_val = float(vals[idx_arr - 1])
-                        display_val = (raw_val + entry.offset) * entry.scale
-                        self._lookval_label.setText(f"查看值: {display_val:.6g}")
-                    elif idx_arr == 0 and len(t_rel) > 0:
-                        raw_val = float(vals[0])
-                        display_val = (raw_val + entry.offset) * entry.scale
-                        self._lookval_label.setText(f"查看值: {display_val:.6g}")
-                    else:
-                        self._lookval_label.setText("查看值: -")
+                    if idx_arr >= len(t_rel):
+                        idx_arr = len(t_rel) - 1
+                    if idx_arr > 0 and abs(t_rel[idx_arr] - look_time) > abs(t_rel[idx_arr - 1] - look_time):
+                        idx_arr -= 1
+                    raw_val = float(vals[idx_arr])
+                    display_val = (raw_val + entry.offset) * entry.scale
+                    self._lookval_label.setText(f"查看值: {display_val:.6g}")
+                else:
+                    self._lookval_label.setText("查看值: -")
         else:
             self._lookval_label.setText("查看值: -")
 
 
-        self._update_cursor_labels()
+        if self._cursor_a_time is not None or self._cursor_b_time is not None:
+            self._update_cursor_labels()
 
 
 
@@ -986,6 +1059,15 @@ class WaveformView(QWidget):
     def _on_realtime_toggled(self, checked: bool) -> None:
         self._realtime_update = checked
         self._scrollbar.setEnabled(not checked)
+
+    def _on_pause_render_toggled(self, checked: bool) -> None:
+        """暂停绘图：停止/恢复 UI 渲染定时器，纯采样模式用于压榨测试。"""
+        if checked:
+            self._refresh_timer.stop()
+            logger.info("绘图已暂停（纯采样模式）")
+        else:
+            self._refresh_timer.start(33)
+            logger.info("绘图已恢复")
 
     def _on_scroll_changed(self, value: int) -> None:
 

@@ -1,7 +1,7 @@
 """plink - 线程安全环形缓冲区
 
 高性能环形缓冲区，用于暂存采样引擎捞上来的数据，供 UI 线程消费。
-支持 2000Hz 采样率下的高频写入，使用 numpy 数组实现零拷贝读取。
+支持 5000Hz 采样率下的高频写入，使用 numpy 数组实现零拷贝读取。
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ class RingBuffer:
     """线程安全环形缓冲区
 
     固定容量的环形缓冲区，使用 numpy 数组存储时间戳和值。
-    支持高频写入 (2000Hz) 和批量读取，用于解耦采样线程和 UI 线程。
+    支持高频写入 (5000Hz) 和批量读取，用于解耦采样线程和 UI 线程。
 
     典型用法：
         buf = RingBuffer(capacity=20000)
@@ -188,8 +188,7 @@ class RingBuffer:
         """获取指定时间范围内的数据点。
 
         使用 np.searchsorted 二分查找，O(log N) 复杂度。
-        若范围跨越环形缓冲区 _head，返回 concatenate 结果（拷贝）；
-        否则返回 slice 视图（零拷贝）。
+        buffer 满时分段搜索，只 concatenate 实际结果切片，避免全量拷贝。
 
         Args:
             start_ns: 起始时间戳（纳秒，包含）
@@ -202,25 +201,51 @@ class RingBuffer:
         if count == 0:
             return np.array([], dtype=np.int64), np.array([], dtype=np.float64)
 
-
         if count < self._capacity:
 
-            ts = self._timestamps[:count]
-            vals = self._values[:count]
-        else:
+            ts_view = self._timestamps[:count]
+            vals_view = self._values[:count]
+            i0 = np.searchsorted(ts_view, start_ns, side='left')
+            i1 = np.searchsorted(ts_view, end_ns, side='right')
+            if i0 >= i1:
+                return np.array([], dtype=np.int64), np.array([], dtype=np.float64)
+            return ts_view[i0:i1], vals_view[i0:i1]
 
-            head = self._head
-            ts = np.concatenate([self._timestamps[head:], self._timestamps[:head]])
-            vals = np.concatenate([self._values[head:], self._values[:head]])
 
 
-        idx_start = np.searchsorted(ts, start_ns, side='left')
-        idx_end = np.searchsorted(ts, end_ns, side='right')
 
-        if idx_start >= idx_end:
+        head = self._head
+        seg1_ts = self._timestamps[head:]
+        seg2_ts = self._timestamps[:head]
+        seg1_vals = self._values[head:]
+        seg2_vals = self._values[:head]
+
+        parts_ts: list[np.ndarray] = []
+        parts_vals: list[np.ndarray] = []
+
+
+        if len(seg1_ts) > 0 and start_ns <= int(seg1_ts[-1]) and end_ns >= int(seg1_ts[0]):
+            i0 = np.searchsorted(seg1_ts, start_ns, side='left')
+            i1 = np.searchsorted(seg1_ts, end_ns, side='right')
+            if i0 < i1:
+                parts_ts.append(seg1_ts[i0:i1])
+                parts_vals.append(seg1_vals[i0:i1])
+
+
+        if head > 0 and end_ns >= int(seg2_ts[0]) and start_ns <= int(seg2_ts[-1]):
+            i0 = np.searchsorted(seg2_ts, start_ns, side='left')
+            i1 = np.searchsorted(seg2_ts, end_ns, side='right')
+            if i0 < i1:
+                parts_ts.append(seg2_ts[i0:i1])
+                parts_vals.append(seg2_vals[i0:i1])
+
+        if not parts_ts:
             return np.array([], dtype=np.int64), np.array([], dtype=np.float64)
+        if len(parts_ts) == 1:
 
-        return ts[idx_start:idx_end], vals[idx_start:idx_end]
+            return parts_ts[0], parts_vals[0]
+
+        return np.concatenate(parts_ts), np.concatenate(parts_vals)
 
     def get_last_value(self) -> Optional[tuple[int, float]]:
         """获取最新的一个数据点
@@ -233,6 +258,23 @@ class RingBuffer:
                 return None
             idx = (self._head - 1) % self._capacity
             return int(self._timestamps[idx]), float(self._values[idx])
+
+    def get_time_range(self) -> Optional[tuple[int, int]]:
+        """获取缓冲区内最早和最晚的时间戳（零拷贝）。
+
+        Returns:
+            (first_ts_ns, last_ts_ns) 元组，或 None 如果缓冲区为空
+        """
+        count = self._count
+        if count == 0:
+            return None
+        head = self._head
+        if count < self._capacity:
+            first = int(self._timestamps[0])
+        else:
+            first = int(self._timestamps[head])
+        last = int(self._timestamps[(head - 1) % self._capacity])
+        return first, last
 
     def clear(self) -> None:
         """清空缓冲区"""
