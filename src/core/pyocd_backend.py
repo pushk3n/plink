@@ -14,18 +14,29 @@ from __future__ import annotations
 import logging
 import struct
 import threading
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from .data_types import VariableInfo
 
+ReadPlanItem = tuple[int, 'VariableInfo']
+
 logger = logging.getLogger(__name__)
 
 
-_RAM_BASE = 0x20000000
+from pyocd.coresight.ap import MEM_AP_CSW, MEM_AP_TAR, MEM_AP_DRW, CSW_SIZE32
 
 
 _BLOCK_MERGE_GAP_DEFAULT = 64
+
+
+
+
+
+
+
+
+_BLOCK_MIN_PAYLOAD_RATIO = 0.20
 
 
 class PyOcdError(Exception):
@@ -53,13 +64,23 @@ class PyOcdBackend:
     """
 
     def __init__(self):
-        self._session = None
-        self._target = None
+        self._session: Any | None = None
+        self._target: Any | None = None
         self._connected = False
         self._lock = threading.Lock()
+        self._last_connect_args = {
+            'unique_id': '',
+            'target_override': 'cortex_m',
+            'frequency': 8000000,
+            'connect_mode': 'attach',
+        }
         self._probe_info: dict = {}
         self._block_merge_gap: int = _BLOCK_MERGE_GAP_DEFAULT
         self._block_max_bytes: int = 128
+        self._ram_address_cache: dict[int, bool] = {}
+        self._read_plan_key: tuple | None = None
+        self._read_plan_blocks: list[list[ReadPlanItem]] = []
+        self._read_plan_solo: list[ReadPlanItem] = []
 
 
 
@@ -107,6 +128,13 @@ class PyOcdBackend:
         from pyocd.core.session import Session
 
         try:
+            self._last_connect_args = {
+                'unique_id': unique_id,
+                'target_override': target_override,
+                'frequency': frequency,
+                'connect_mode': connect_mode,
+            }
+
 
             if unique_id:
 
@@ -227,40 +255,46 @@ class PyOcdBackend:
     def _update_block_merge_strategy(self) -> None:
         """根据探针传输类型设置 Block 合并参数。
 
-        packet_size=64 是 CMSIS-DAP 协议层命令缓冲区大小。
-        一个 64 字节 DAP_TransferBlock 命令可装 ~14 个 word 读取 (56字节数据)。
+        核心策略: 带宽换时间 — 将 n 次 USB 往返降为少数几次。
+        USB 延迟与往返次数成正比，与数据量几乎无关:
+        - 10 次读 4B (HID) ≈ 10ms，2 次读 1024B ≈ 4ms
+        - 合并读取用少量冗余带宽换取显著延迟降低
 
-        HID vs Bulk 的核心差异不在包大小，而在流水线能力:
-        - HID: packet_count=1，只能发一个命令等一个回复
-        - Bulk: packet_count=6+，可连续发多个命令流水线执行
+        merge_gap 设为极大值 (64KB): 聚类条件退化为纯 Block 大小约束，
+        不再因变量间距大而强制拆分 — 只要 Block 总大小未超限就合并。
 
-        策略:
-        - V1 HID: 保守合并，减少 Block 数以减少 1ms 轮询次数
-        - V2 Bulk: 积极合并，利用流水线能力，但单 Block 不宜过大
-          (过大的 Block 会被拆成过多 DAP 命令，增加协议开销)
+        max_bytes 设定依据:
+        - 1024B = 256 words → 2 个 DAP_TransferBlock 命令 (每个最多 128 words)
+        - 2048B = 512 words → 4 个 DAP 命令，Bulk 流水线可一次发出
+        - pyOCD 内部自动拆分大请求，用户层无需关心
         """
         transport = self._probe_info.get('transport', 'unknown')
 
         if transport == 'hid':
 
 
-            self._block_merge_gap = 128
-            self._block_max_bytes = 256
+
+            self._block_merge_gap = 65536
+            self._block_max_bytes = 1024
         elif transport == 'bulk':
 
 
 
-            self._block_merge_gap = 512
-            self._block_max_bytes = 512
+            self._block_merge_gap = 65536
+            self._block_max_bytes = 2048
         else:
-            self._block_merge_gap = _BLOCK_MERGE_GAP_DEFAULT
-            self._block_max_bytes = 128
+            self._block_merge_gap = 65536
+            self._block_max_bytes = 512
 
     def disconnect(self) -> None:
         """断开连接，释放探针。目标 MCU 继续运行（resume_on_disconnect=True）。"""
         self._connected = False
         self._target = None
         self._probe_info = {}
+        self._ram_address_cache.clear()
+        self._read_plan_key = None
+        self._read_plan_blocks = []
+        self._read_plan_solo = []
         if self._session:
             try:
                 self._session.close()
@@ -275,32 +309,17 @@ class PyOcdBackend:
         Returns:
             True 表示重连成功，False 表示失败。
         """
-
-        probe_id = ""
-        target = "cortex_m"
-        freq = 8000000
+        connect_args = dict(self._last_connect_args)
         if self._session:
             try:
-                probe_id = self._session.probe.unique_id if self._session.probe else ""
-                try:
-                    target = self._session.options.get("target_override")
-                except KeyError:
-                    pass
-                try:
-                    freq = self._session.options.get("frequency")
-                except KeyError:
-                    pass
+                if self._session.probe:
+                    connect_args['unique_id'] = self._session.probe.unique_id
             except Exception:
                 pass
 
         try:
             self.disconnect()
-            self.connect(
-                unique_id=probe_id,
-                target_override=target,
-                frequency=freq,
-                connect_mode="attach",
-            )
+            self.connect(**connect_args)
             logger.info("pyOCD 重连成功")
             return True
         except PyOcdError as e:
@@ -329,23 +348,25 @@ class PyOcdBackend:
                 return 0
         return 0
 
+    def _require_target(self) -> Any:
+        """返回已连接的 target 对象。"""
+        if not self._connected or self._target is None:
+            raise PyOcdError("未连接到探针")
+        return self._target
+
 
 
     def read32(self, address: int) -> int:
         """读取 32 位整数。目标运行中可读。"""
-        if not self._connected or not self._target:
-            raise PyOcdError("未连接到探针")
         try:
-            return self._target.read32(address)
+            return self._require_target().read32(address)
         except Exception as e:
             raise PyOcdError(f"读取 0x{address:08X} 失败: {e}") from e
 
     def read_memory(self, address: int, size: int) -> bytes:
         """读取原始内存数据（小端序）。目标运行中可读。"""
-        if not self._connected or not self._target:
-            raise PyOcdError("未连接到探针")
         try:
-            data = self._target.read_memory_block8(address, size)
+            data = self._require_target().read_memory_block8(address, size)
             return bytes(data)
         except Exception as e:
             raise PyOcdError(f"读取 0x{address:08X} ({size}B) 失败: {e}") from e
@@ -400,7 +421,7 @@ class PyOcdBackend:
     def _single_read(self, var) -> list[Optional[bytes]]:
         """单变量快速读取路径。"""
         try:
-            target = self._target
+            target = self._require_target()
             size = var.size
             if size == 4:
                 val = target.read32(var.address)
@@ -431,31 +452,21 @@ class PyOcdBackend:
 
     def _aggregated_read(self, variables: list) -> list[Optional[bytes]]:
         """聚合读取主逻辑。"""
-        target = self._target
+        target = self._require_target()
         n = len(variables)
-
-
-        indexed = [(i, v) for i, v in enumerate(variables)]
-        indexed.sort(key=lambda x: x[1].address)
-
-
-
-        agg_items: list[tuple[int, object]] = []
-        solo_items: list[tuple[int, object]] = []
-
-        for orig_idx, var in indexed:
-            if var.size > 8 or var.var_type.value == 'unknown' or var.address < _RAM_BASE:
-                solo_items.append((orig_idx, var))
-            else:
-                agg_items.append((orig_idx, var))
 
         results: list[Optional[bytes]] = [None] * n
 
+        blocks, solo_items = self._get_read_plan(variables)
 
-        if agg_items:
-            blocks = self._cluster_blocks(agg_items)
-            for block in blocks:
-                self._read_block(block, results)
+
+        if blocks:
+            if len(blocks) > 1:
+
+                self._pipelined_batch_read(blocks, results)
+            else:
+
+                self._read_block(blocks[0], results)
 
 
         for orig_idx, var in solo_items:
@@ -475,42 +486,77 @@ class PyOcdBackend:
 
         return results
 
+    def _get_read_plan(
+        self,
+        variables: list,
+    ) -> tuple[list[list[ReadPlanItem]], list[ReadPlanItem]]:
+        """获取聚合读取计划。变量列表不变时复用排序/聚类结果。"""
+        plan_key = tuple((id(v), v.address, v.size, v.var_type.value) for v in variables)
+        if plan_key == self._read_plan_key:
+            return self._read_plan_blocks, self._read_plan_solo
+
+        indexed = [(i, v) for i, v in enumerate(variables)]
+        indexed.sort(key=lambda x: x[1].address)
+
+        agg_items: list[ReadPlanItem] = []
+        solo_items: list[ReadPlanItem] = []
+
+        for orig_idx, var in indexed:
+            if var.size > 8 or var.var_type.value == 'unknown' or not self._is_ram_address(var.address):
+                solo_items.append((orig_idx, var))
+            else:
+                agg_items.append((orig_idx, var))
+
+        blocks = self._cluster_blocks(agg_items) if agg_items else []
+        self._read_plan_key = plan_key
+        self._read_plan_blocks = blocks
+        self._read_plan_solo = solo_items
+        return blocks, solo_items
+
     def _cluster_blocks(
-        self, items: list[tuple[int, object]]
-    ) -> list[list[tuple[int, object]]]:
+        self, items: list[ReadPlanItem]
+    ) -> list[list[ReadPlanItem]]:
         """将按地址排序的变量聚类为 Block。
 
-        相邻变量首尾间距 < _block_merge_gap 时合并为同一 Block。
-        同时限制单个 Block 的总字节数不超过 _block_max_bytes，
-        避免大 Block 被底层 USB 层拆包后反而增加事务数。
+        合并条件同时考虑地址间距、Block 最大覆盖范围和有效载荷比例，
+        避免为了少量变量读取大段无关 RAM。
         """
         if not items:
             return []
 
-        blocks: list[list[tuple[int, object]]] = [[items[0]]]
+        blocks: list[list[ReadPlanItem]] = [[items[0]]]
         prev_end = items[0][1].address + items[0][1].size
+        block_payload_bytes = items[0][1].size
 
         for item in items[1:]:
             var = item[1]
             gap = var.address - prev_end
             new_block_bytes = (var.address + var.size) - blocks[-1][0][1].address
+            new_payload_bytes = block_payload_bytes + var.size
+            payload_ratio = new_payload_bytes / max(new_block_bytes, 1)
 
 
-            if gap < self._block_merge_gap and new_block_bytes <= self._block_max_bytes:
+            if (
+                gap < self._block_merge_gap
+                and new_block_bytes <= self._block_max_bytes
+                and payload_ratio >= _BLOCK_MIN_PAYLOAD_RATIO
+            ):
                 blocks[-1].append(item)
+                block_payload_bytes = new_payload_bytes
             else:
                 blocks.append([item])
+                block_payload_bytes = var.size
             prev_end = var.address + var.size
 
         return blocks
 
     def _read_block(
         self,
-        block: list[tuple[int, object]],
+        block: list[ReadPlanItem],
         results: list[Optional[bytes]],
     ) -> None:
         """读取一个聚合 Block 并分发结果到 results 数组。"""
-        target = self._target
+        target = self._require_target()
 
 
         block_start = block[0][1].address
@@ -542,6 +588,90 @@ class PyOcdBackend:
                 except Exception:
                     results[orig_idx] = None
 
+    def _pipelined_batch_read(
+        self,
+        blocks: list[list[ReadPlanItem]],
+        results: list[Optional[bytes]],
+    ) -> None:
+        """跨 Block 流水线读取 — 利用 pyOCD 延迟传输机制打包多个 Block 的 DAP 命令.
+
+        核心原理:
+          传统方式: Block1 send→wait→Block2 send→wait→Block3 send→wait
+                    总耗时 = N × USB_round_trip
+          流水线:   Block1+Block2+Block3 一次性 send → 一次性 wait
+                    总耗时 = ceil(N_cmds / pipeline_depth) × USB_round_trip
+
+        Bulk V2 下 pipeline_depth=6+, 3 个 Block (各 2 DAP 命令) 可 1 轮完成.
+        HID V1 下 pipeline_depth=1, 退化为逐个发送, 无额外开销.
+        """
+        target = self._require_target()
+        ap = target.ap
+        dp = ap.dp
+        ap_base = ap.address.address + getattr(ap, '_reg_offset', 0)
+
+        try:
+
+            csw = getattr(target, '_csw', 0x23000000)
+            dp.write_ap(ap_base + MEM_AP_CSW, csw | CSW_SIZE32)
+
+
+            deferred: list[tuple] = []
+            for block in blocks:
+                block_start = block[0][1].address
+                block_end = block[-1][1].address + block[-1][1].size
+                aligned_start = block_start & ~3
+                aligned_end = (block_end + 3) & ~3
+                word_count = (aligned_end - aligned_start) // 4
+
+
+                dp.write_ap(ap_base + MEM_AP_TAR, aligned_start, now=False)
+                callback = dp.read_ap_multiple(ap_base + MEM_AP_DRW, word_count, now=False)
+
+                deferred.append((block, aligned_start, callback))
+
+
+            dp.flush()
+
+
+            for block, aligned_start, callback in deferred:
+                try:
+                    words = callback()
+                    block_bytes = bytearray()
+                    for w in words:
+                        block_bytes.extend(w.to_bytes(4, 'little'))
+                    for orig_idx, var in block:
+                        offset = var.address - aligned_start
+                        results[orig_idx] = bytes(block_bytes[offset:offset + var.size])
+                except Exception:
+
+                    self._read_block(block, results)
+
+        except Exception as e:
+            logger.debug("流水线读取失败, 退化为串行: %s", e)
+
+            for block in blocks:
+                self._read_block(block, results)
+
+    def _is_ram_address(self, address: int) -> bool:
+        """判断地址是否位于 RAM 区域 (从 pyOCD memory map 动态获取).
+
+        避免硬编码 RAM 基地址, 兼容不同 MCU (STM32/GD32/NXP 等).
+        读取 Flash 区域会导致 CPU 取指 Stall, 必须排除.
+        """
+        if not self._session:
+            return True
+        cached = self._ram_address_cache.get(address)
+        if cached is not None:
+            return cached
+        try:
+            region = self._session.target.memory_map.get_region_for_address(address)
+            is_ram = region is not None and region.is_ram
+        except Exception as e:
+            logger.debug("RAM 区域查询失败 @ 0x%08X: %s", address, e)
+            is_ram = False
+        self._ram_address_cache[address] = is_ram
+        return is_ram
+
 
 
     def write_variable(self, var: 'VariableInfo', raw_int_value: int) -> None:
@@ -556,11 +686,8 @@ class PyOcdBackend:
         Raises:
             WriteError: 写入失败
         """
-        if not self._connected or not self._target:
-            raise WriteError("未连接到探针")
-
         try:
-            target = self._target
+            target = self._require_target()
             if var.size == 4:
                 target.write32(var.address, raw_int_value & 0xFFFFFFFF)
             elif var.size == 2:
@@ -644,7 +771,7 @@ class PyOcdBackend:
         策略 1（首选）：pyOCD 标准 API — reset_and_halt() / reset()
         策略 2（兜底）：直接操作 ARM 核心寄存器 — AIRCR + DEMCR VC_CORERESET
         """
-        target = self._target
+        target = self._require_target()
 
 
         try:

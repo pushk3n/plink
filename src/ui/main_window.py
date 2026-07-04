@@ -1216,7 +1216,7 @@ class MainWindow(QMainWindow):
             "版本: 5.0.0\n"
             "技术栈: Python + PyQt6 + pyelftools + pyOCD\n\n"
             "支持 C++ 命名空间、类成员、模板类型的符号解析\n"
-            "最高支持 5000Hz 采样率（聚合读取引擎）\n"
+            "采样率受变量布局、探针链路与绘图负载影响\n"
             "pyOCD 直连 DAP，无需 OpenOCD 中间层\n"
             "新增：双游标、局部统计、触发系统、配置持久化"
         )

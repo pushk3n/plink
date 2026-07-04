@@ -1,6 +1,6 @@
 """plink v5.0 - 高速采样引擎
 
-通过 pyOCD 直连 CMSIS-DAP 探针高速读取 MCU 内存数据，支持最高 5000Hz 采样率。
+通过 pyOCD 直连 CMSIS-DAP 探针高速读取 MCU 内存数据，采样率受变量布局、探针链路与绘图负载影响。
 v5.0: 聚合读取引擎、写入互斥锁、连接异常分类与信号通知。
 
 v3.0 变更：
@@ -48,7 +48,7 @@ _STRUCT_FMT_MAP: dict[VarType, str] = {
 class SamplingEngine:
     """v5.0 高速采样引擎
 
-    使用 pyOCD 聚合读取引擎批量内存读取，支持最高 2000Hz 采样率。
+    使用 pyOCD 聚合读取引擎批量内存读取，典型速率取决于变量布局和探针传输方式。
     热路径零内存分配：预编译 struct.Struct，使用预分配 RingBuffer。
 
     v5.0 新增：
@@ -187,7 +187,7 @@ class SamplingEngine:
 
 
     def set_frequency(self, hz: int) -> None:
-        """设置采样频率，范围 1~5000Hz。"""
+        """设置采样频率，范围 1~5000Hz。实际可达速率取决于链路能力。"""
         hz = max(1, min(5000, hz))
         self._interval_ns = int(1_000_000_000 / hz)
         self._frequency = hz
